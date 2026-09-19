@@ -29,7 +29,7 @@ use crate::Config;
 use crate::error::{CloseReason, Error, Result};
 use crate::handshake::{
     HandshakeResult, build_request_with_headers, build_response, generate_accept_key, generate_key,
-    parse_request, parse_response, validate_accept_key,
+    parse_request, parse_response, validate_accept_key, validate_selected_protocol,
 };
 use crate::heartbeat::{Deadline, Heartbeat, bounded_close_reason};
 use crate::protocol::{Message, Protocol, Role};
@@ -37,6 +37,7 @@ use crate::protocol::{Message, Protocol, Role};
 #[cfg(any(feature = "http2", feature = "http3"))]
 use crate::extended_connect::{
     ExtendedConnectRequest, build_extended_connect_error, build_extended_connect_response,
+    validate_extended_connect_response,
 };
 
 /// Re-exported Compio `#[main]` runtime macro for users of `compio-runtime`.
@@ -319,6 +320,7 @@ where
             if !validate_accept_key(&key, accept) {
                 return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Accept"));
             }
+            validate_selected_protocol(protocol, res.protocol)?;
 
             let res_protocol = res.protocol.map(String::from);
             let res_extensions = res.extensions.map(String::from);
@@ -594,6 +596,7 @@ impl CompioHttp2Connection {
         if response.status() != http::StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), protocol)?;
 
         let stream = CompioHttp2Stream::new(send_stream, response.into_body());
         Ok(CompioWebSocketStream::client(stream, self.config.clone()))
@@ -912,6 +915,7 @@ impl CompioHttp3Connection {
         if response.status() != http::StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), protocol)?;
 
         let stream = CompioHttp3ClientStream::new(
             stream,

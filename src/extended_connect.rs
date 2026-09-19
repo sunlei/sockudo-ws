@@ -399,6 +399,28 @@ pub fn build_extended_connect_response(
     builder.body(()).expect("valid response")
 }
 
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub(crate) fn validate_extended_connect_response(
+    headers: &HeaderMap,
+    offered_protocol: Option<&str>,
+) -> crate::error::Result<()> {
+    let mut protocols = headers.get_all("sec-websocket-protocol").iter();
+    let selected_protocol = protocols
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| crate::error::Error::HandshakeFailed("invalid subprotocol response"))
+        })
+        .transpose()?;
+    if protocols.next().is_some() {
+        return Err(crate::error::Error::HandshakeFailed(
+            "duplicate Sec-WebSocket-Protocol",
+        ));
+    }
+    crate::handshake::validate_selected_protocol(offered_protocol, selected_protocol)
+}
+
 /// Build an HTTP error response for rejecting Extended CONNECT
 ///
 /// # Arguments
@@ -447,6 +469,21 @@ mod tests {
             response.headers().get("sec-websocket-protocol").unwrap(),
             "graphql-ws"
         );
+    }
+
+    #[test]
+    fn response_subprotocol_must_be_a_single_offered_value() {
+        let response = build_extended_connect_response(Some("superchat"), None);
+        assert!(
+            validate_extended_connect_response(response.headers(), Some("chat, superchat")).is_ok()
+        );
+        assert!(validate_extended_connect_response(response.headers(), Some("chat")).is_err());
+
+        let mut duplicate = response;
+        duplicate
+            .headers_mut()
+            .append("sec-websocket-protocol", "chat".parse().unwrap());
+        assert!(validate_extended_connect_response(duplicate.headers(), Some("chat")).is_err());
     }
 
     #[test]

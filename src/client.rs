@@ -42,6 +42,8 @@ use crate::transport::Http2;
 use crate::transport::Http3;
 
 #[cfg(any(feature = "http2", feature = "http3"))]
+use crate::extended_connect::validate_extended_connect_response;
+#[cfg(any(feature = "http2", feature = "http3"))]
 use crate::multiplex::MultiplexedConnection;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -521,6 +523,7 @@ impl WebSocketClient<Http2> {
         if response.status() != http::StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), protocol)?;
 
         // Get the receive stream from the response
         let recv_stream = response.into_body();
@@ -724,6 +727,7 @@ impl WebSocketClient<Http3> {
         // Check response status per RFC 9220
         match response.status() {
             StatusCode::OK => {
+                validate_extended_connect_response(response.headers(), subprotocol)?;
                 let h3_stream = Stream::<Http3>::from_h3_client_with_handles(
                     stream,
                     Some(endpoint),
