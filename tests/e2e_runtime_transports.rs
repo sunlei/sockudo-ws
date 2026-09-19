@@ -35,6 +35,7 @@ mod h3_support {
 #[cfg(all(feature = "tokio-runtime", feature = "http2"))]
 mod tokio_http2_e2e {
     use futures_util::{SinkExt, StreamExt};
+    use http::Request;
     use sockudo_ws::{Config, Http2, Message, WebSocketClient, WebSocketServer};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -46,6 +47,8 @@ mod tokio_http2_e2e {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             WebSocketServer::<Http2>::new(Config::default())
+                .protocols(["sockudo.e2e"])
+                .unwrap()
                 .serve(stream, |mut ws, req| async move {
                     assert_eq!(req.path, "/tokio-h2");
                     let msg = ws.next().await.unwrap().unwrap();
@@ -73,6 +76,48 @@ mod tokio_http2_e2e {
 
         drop(ws);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_selects_http2_subprotocol_in_server_preference_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            WebSocketServer::<Http2>::new(Config::default())
+                .protocols(["superchat", "chat"])
+                .unwrap()
+                .serve(stream, |_ws, _req| async {})
+                .await
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, connection) = h2::client::handshake(stream).await.unwrap();
+        let connection_task = tokio::spawn(async move { connection.await.unwrap() });
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://localhost:{}/ws", addr.port()))
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "chat, superchat")
+            .body(())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from_static("websocket"));
+
+        let (response, _send_stream) = send_request.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+
+        assert_eq!(
+            response.headers().get("sec-websocket-protocol").unwrap(),
+            "superchat"
+        );
+        server_task.abort();
+        connection_task.abort();
+        let _ = server_task.await;
+        let _ = connection_task.await;
     }
 
     #[tokio::test]
@@ -138,7 +183,9 @@ mod tokio_http3_e2e {
         let (server_tls, client_tls) = crate::h3_support::tls_configs();
         let endpoint = server_endpoint(server_tls);
         let addr = endpoint.local_addr().unwrap();
-        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), Config::default());
+        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), Config::default())
+            .protocols(["sockudo.e2e"])
+            .unwrap();
 
         let server_task = tokio::spawn(async move {
             server
@@ -154,7 +201,7 @@ mod tokio_http3_e2e {
 
         let client = WebSocketClient::<Http3>::new(Config::default());
         let mut ws = client
-            .connect(addr, "localhost", "/tokio-h3", client_tls)
+            .connect_with_protocol(addr, "localhost", "/tokio-h3", "sockudo.e2e", client_tls)
             .await
             .unwrap();
 
@@ -213,7 +260,7 @@ mod tokio_http3_e2e {
 #[cfg(feature = "compio-runtime")]
 mod compio_http1_e2e {
     use sockudo_ws::compio::net::{TcpListener, TcpStream};
-    use sockudo_ws::compio::{accept_async, connect_async, runtime};
+    use sockudo_ws::compio::{accept_async_with_protocols, connect_async, runtime};
     use sockudo_ws::{Config, Message};
 
     #[compio::test]
@@ -223,7 +270,10 @@ mod compio_http1_e2e {
 
         let server_task = runtime::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (mut ws, req) = accept_async(stream, Config::default()).await.unwrap();
+            let (mut ws, req) =
+                accept_async_with_protocols(stream, Config::default(), ["sockudo.e2e"])
+                    .await
+                    .unwrap();
             assert_eq!(req.path, "/compio-h1");
             let msg = ws.next().await.unwrap().unwrap();
             assert!(matches!(&msg, Message::Text(text) if text == "compio-h1"));
@@ -241,6 +291,7 @@ mod compio_http1_e2e {
         .await
         .unwrap();
         assert_eq!(req.path, "/compio-h1");
+        assert_eq!(req.protocol.as_deref(), Some("sockudo.e2e"));
 
         ws.send_text("compio-h1").await.unwrap();
         let echoed = ws.next().await.unwrap().unwrap();
@@ -253,7 +304,9 @@ mod compio_http1_e2e {
 #[cfg(all(feature = "compio-runtime", feature = "http2"))]
 mod compio_http2_e2e {
     use sockudo_ws::compio::net::{TcpListener, TcpStream};
-    use sockudo_ws::compio::{connect_http2, connect_http2_multiplexed, runtime, serve_http2};
+    use sockudo_ws::compio::{
+        connect_http2, connect_http2_multiplexed, runtime, serve_http2, serve_http2_with_protocols,
+    };
     use sockudo_ws::{Config, Message};
 
     #[compio::test]
@@ -263,12 +316,17 @@ mod compio_http2_e2e {
 
         let server_task = runtime::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_http2(stream, Config::default(), |mut ws, req| async move {
-                assert_eq!(req.path, "/compio-h2");
-                let msg = ws.next().await.unwrap().unwrap();
-                assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
-                ws.send(msg).await.unwrap();
-            })
+            serve_http2_with_protocols(
+                stream,
+                Config::default(),
+                ["sockudo.e2e"],
+                |mut ws, req| async move {
+                    assert_eq!(req.path, "/compio-h2");
+                    let msg = ws.next().await.unwrap().unwrap();
+                    assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
+                    ws.send(msg).await.unwrap();
+                },
+            )
             .await
             .unwrap();
         });
@@ -356,7 +414,9 @@ mod compio_http3_e2e {
         let (server_tls, client_tls) = crate::h3_support::tls_configs();
         let endpoint = server_endpoint(server_tls).await;
         let addr = endpoint.local_addr().unwrap();
-        let server = CompioHttp3Server::from_endpoint(endpoint.clone(), Config::default());
+        let server = CompioHttp3Server::from_endpoint(endpoint.clone(), Config::default())
+            .protocols(["sockudo.e2e"])
+            .unwrap();
 
         let server_task = runtime::spawn(async move {
             server

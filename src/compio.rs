@@ -12,6 +12,8 @@ use std::marker::PhantomData;
 #[cfg(feature = "http2")]
 use std::pin::Pin;
 use std::rc::Rc;
+#[cfg(any(feature = "http2", feature = "http3"))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "http2", feature = "http3"))]
@@ -29,7 +31,8 @@ use crate::Config;
 use crate::error::{CloseReason, Error, Result};
 use crate::handshake::{
     HandshakeResult, build_request_with_headers, build_response, generate_accept_key, generate_key,
-    parse_request, parse_response, validate_accept_key,
+    parse_request, parse_response, select_subprotocol, validate_accept_key,
+    validate_supported_protocols,
 };
 use crate::heartbeat::{Deadline, Heartbeat, bounded_close_reason};
 use crate::protocol::{Message, Protocol, Role};
@@ -210,7 +213,23 @@ pub async fn server_handshake<S>(stream: &mut S) -> Result<HandshakeResult>
 where
     S: AsyncRead + AsyncWrite + ?Sized,
 {
-    server_handshake_with_extensions(stream, None).await
+    server_handshake_with_supported_protocols(stream, &[], None).await
+}
+
+/// Perform a server-side handshake using supported subprotocols in server
+/// preference order.
+pub async fn server_handshake_with_protocols<S, I, P>(
+    stream: &mut S,
+    protocols: I,
+) -> Result<HandshakeResult>
+where
+    S: AsyncRead + AsyncWrite + ?Sized,
+    I: IntoIterator<Item = P>,
+    P: Into<String>,
+{
+    let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+    validate_supported_protocols(&protocols)?;
+    server_handshake_with_supported_protocols(stream, &protocols, None).await
 }
 
 /// Perform a server-side WebSocket handshake and include an extension response.
@@ -220,6 +239,17 @@ where
 /// header to be sent during upgrade.
 pub async fn server_handshake_with_extensions<S>(
     stream: &mut S,
+    response_extensions: Option<&str>,
+) -> Result<HandshakeResult>
+where
+    S: AsyncRead + AsyncWrite + ?Sized,
+{
+    server_handshake_with_supported_protocols(stream, &[], response_extensions).await
+}
+
+async fn server_handshake_with_supported_protocols<S>(
+    stream: &mut S,
+    protocols: &[String],
     response_extensions: Option<&str>,
 ) -> Result<HandshakeResult>
 where
@@ -239,10 +269,10 @@ where
 
         if let Some((req, consumed)) = parse_request(&buf)? {
             let path = req.path.to_string();
-            let protocol = req.protocol.map(String::from);
+            let protocol = select_subprotocol(req.protocol, protocols).map(str::to_owned);
             let extensions = req.extensions.map(String::from);
             let accept_key = generate_accept_key(req.key);
-            let response = build_response(&accept_key, req.protocol, response_extensions);
+            let response = build_response(&accept_key, protocol.as_deref(), response_extensions);
 
             write_all_owned(stream, response).await?;
             stream.flush().await?;
@@ -341,13 +371,31 @@ where
 
 /// Accept an already-connected Compio transport as a server WebSocket.
 pub async fn accept_async<S>(
-    mut stream: S,
+    stream: S,
     config: Config,
 ) -> Result<(CompioWebSocketStream<S>, HandshakeResult)>
 where
     S: AsyncRead + AsyncWrite,
 {
-    let handshake = server_handshake(&mut stream).await?;
+    accept_async_with_protocols(stream, config, std::iter::empty::<String>()).await
+}
+
+/// Accept a Compio transport using supported subprotocols in server preference
+/// order.
+pub async fn accept_async_with_protocols<S, I, P>(
+    mut stream: S,
+    config: Config,
+    protocols: I,
+) -> Result<(CompioWebSocketStream<S>, HandshakeResult)>
+where
+    S: AsyncRead + AsyncWrite,
+    I: IntoIterator<Item = P>,
+    P: Into<String>,
+{
+    let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+    validate_supported_protocols(&protocols)?;
+    let handshake =
+        server_handshake_with_supported_protocols(&mut stream, &protocols, None).await?;
     let ws =
         CompioWebSocketStream::server_with_leftover(stream, config, handshake.leftover.clone());
     Ok((ws, handshake))
@@ -657,7 +705,32 @@ where
         + 'static,
     Fut: Future<Output = ()> + 'static,
 {
+    serve_http2_with_protocols(stream, config, std::iter::empty::<String>(), handler).await
+}
+
+/// Serve HTTP/2 WebSocket streams with supported subprotocols in server
+/// preference order.
+#[cfg(feature = "http2")]
+pub async fn serve_http2_with_protocols<S, F, Fut, I, P>(
+    stream: S,
+    config: Config,
+    protocols: I,
+    handler: F,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + 'static,
+    F: Fn(CompioWebSocketStream<CompioHttp2Stream>, ExtendedConnectRequest) -> Fut
+        + Clone
+        + 'static,
+    Fut: Future<Output = ()> + 'static,
+    I: IntoIterator<Item = P>,
+    P: Into<String>,
+{
     use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+    validate_supported_protocols(&protocols)?;
+    let protocols: Arc<[String]> = protocols.into();
 
     let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
     let mut builder = h2::server::Builder::new();
@@ -675,9 +748,11 @@ where
         };
         let handler = handler.clone();
         let config = config.clone();
+        let protocols = protocols.clone();
 
         runtime::spawn(async move {
-            if let Err(e) = handle_http2_request(request, respond, handler, config).await {
+            if let Err(e) = handle_http2_request(request, respond, handler, config, protocols).await
+            {
                 eprintln!("HTTP/2 WebSocket error: {}", e);
             }
         })
@@ -693,6 +768,7 @@ async fn handle_http2_request<F, Fut>(
     mut respond: h2::server::SendResponse<Bytes>,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(CompioWebSocketStream<CompioHttp2Stream>, ExtendedConnectRequest) -> Fut + 'static,
@@ -709,7 +785,8 @@ where
             return Ok(());
         }
 
-        let response = build_extended_connect_response(None, None);
+        let selected_protocol = select_subprotocol(ws_req.subprotocols.as_deref(), &protocols);
+        let response = build_extended_connect_response(selected_protocol, None);
         let send_stream = respond
             .send_response(response, false)
             .map_err(Error::from)?;
@@ -999,6 +1076,7 @@ pub async fn connect_http3_multiplexed(
 pub struct CompioHttp3Server {
     endpoint: ::compio::quic::Endpoint,
     config: Config,
+    protocols: Arc<[String]>,
 }
 
 #[cfg(feature = "http3")]
@@ -1015,12 +1093,32 @@ impl CompioHttp3Server {
             .await
             .map_err(Error::Io)?;
 
-        Ok(Self { endpoint, config })
+        Ok(Self {
+            endpoint,
+            config,
+            protocols: Arc::default(),
+        })
     }
 
     /// Build a server from an existing Compio QUIC endpoint.
     pub fn from_endpoint(endpoint: ::compio::quic::Endpoint, config: Config) -> Self {
-        Self { endpoint, config }
+        Self {
+            endpoint,
+            config,
+            protocols: Arc::default(),
+        }
+    }
+
+    /// Set supported WebSocket subprotocols in server preference order.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+        validate_supported_protocols(&protocols)?;
+        self.protocols = protocols.into();
+        Ok(self)
     }
 
     /// Get the local UDP address.
@@ -1039,9 +1137,11 @@ impl CompioHttp3Server {
         while let Some(incoming) = self.endpoint.wait_incoming().await {
             let handler = handler.clone();
             let config = self.config.clone();
+            let protocols = self.protocols.clone();
 
             runtime::spawn(async move {
-                if let Err(e) = handle_http3_connection(incoming, handler, config).await {
+                if let Err(e) = handle_http3_connection(incoming, handler, config, protocols).await
+                {
                     eprintln!("HTTP/3 connection error: {}", e);
                 }
             })
@@ -1062,6 +1162,7 @@ async fn handle_http3_connection<F, Fut>(
     incoming: ::compio::quic::Incoming,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(CompioWebSocketStream<CompioHttp3ServerStream>, ExtendedConnectRequest) -> Fut
@@ -1088,9 +1189,11 @@ where
         let (request, stream) = resolver.resolve_request().await.map_err(Error::from)?;
         let handler = handler.clone();
         let config = config.clone();
+        let protocols = protocols.clone();
 
         runtime::spawn(async move {
-            if let Err(e) = handle_http3_request(request, stream, handler, config).await {
+            if let Err(e) = handle_http3_request(request, stream, handler, config, protocols).await
+            {
                 eprintln!("HTTP/3 request error: {}", e);
             }
         })
@@ -1106,6 +1209,7 @@ async fn handle_http3_request<F, Fut>(
     mut stream: CompioH3ServerRequestStream,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(CompioWebSocketStream<CompioHttp3ServerStream>, ExtendedConnectRequest) -> Fut + 'static,
@@ -1142,7 +1246,8 @@ where
         return Ok(());
     }
 
-    let response = build_extended_connect_response(None, None);
+    let selected_protocol = select_subprotocol(ws_req.subprotocols.as_deref(), &protocols);
+    let response = build_extended_connect_response(selected_protocol, None);
     stream.send_response(response).await.map_err(Error::from)?;
 
     let ws = CompioWebSocketStream::server(CompioHttp3ServerStream::new(stream), config);

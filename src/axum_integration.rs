@@ -49,7 +49,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::Config;
 use crate::error::{CloseReason, Error, Result};
-use crate::handshake::generate_accept_key;
+use crate::handshake::{generate_accept_key, select_subprotocol, validate_supported_protocols};
 use crate::protocol::{Message, Role};
 use crate::stream::WebSocketStream;
 use crate::{SplitReader, SplitWriter};
@@ -65,6 +65,7 @@ use crate::stream::{CompressedSplitReader, CompressedSplitWriter, CompressedWebS
 /// a method to upgrade the connection.
 pub struct WebSocketUpgrade {
     key: String,
+    offered_protocols: Option<String>,
     protocol: Option<String>,
     extensions: Option<String>,
     config: Config,
@@ -94,6 +95,19 @@ impl WebSocketUpgrade {
     pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.config.write_buffer_size = size;
         self
+    }
+
+    /// Select a client-offered subprotocol using server preference order.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+        validate_supported_protocols(&protocols)?;
+        self.protocol =
+            select_subprotocol(self.offered_protocols.as_deref(), &protocols).map(str::to_owned);
+        Ok(self)
     }
 
     /// Upgrade the connection and call the provided handler
@@ -233,11 +247,11 @@ where
         }
 
         // Optional: Sec-WebSocket-Protocol
-        let protocol = parts
+        let offered_protocols = parts
             .headers
             .get("sec-websocket-protocol")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+            .map(String::from);
 
         // Optional: Sec-WebSocket-Extensions
         let extensions = parts
@@ -254,7 +268,8 @@ where
 
         Ok(WebSocketUpgrade {
             key,
-            protocol,
+            offered_protocols,
+            protocol: None,
             extensions,
             config: Config::default(),
             on_upgrade,
@@ -692,6 +707,44 @@ mod tests {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = generate_accept_key(key);
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    async fn subprotocol_handler(upgrade: WebSocketUpgrade) -> impl IntoResponse {
+        upgrade
+            .protocols(["superchat", "chat"])
+            .unwrap()
+            .on_upgrade(|_| async {})
+    }
+
+    #[tokio::test]
+    async fn axum_selects_subprotocol_in_server_preference_order() {
+        use axum::{Router, routing::get};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let app = Router::new().route("/protocol", get(subprotocol_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut request = format!("ws://{address}/protocol")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "chat, superchat".parse().unwrap());
+        let (_websocket, response) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("sec-websocket-protocol").unwrap(),
+            "superchat"
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

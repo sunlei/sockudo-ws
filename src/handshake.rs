@@ -274,6 +274,33 @@ fn is_header_name_byte(byte: u8) -> bool {
         )
 }
 
+pub(crate) fn validate_supported_protocols(protocols: &[String]) -> Result<()> {
+    if protocols
+        .iter()
+        .all(|protocol| !protocol.is_empty() && protocol.bytes().all(is_header_name_byte))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidHttp("invalid supported subprotocol"))
+    }
+}
+
+pub(crate) fn select_subprotocol<'a>(
+    offered: Option<&str>,
+    supported: &'a [String],
+) -> Option<&'a str> {
+    let offered = offered?;
+    supported
+        .iter()
+        .find(|supported| {
+            offered
+                .split(',')
+                .map(str::trim)
+                .any(|offered| offered == supported.as_str())
+        })
+        .map(String::as_str)
+}
+
 fn build_request_inner(
     host: &str,
     path: &str,
@@ -417,6 +444,34 @@ pub async fn server_handshake<S>(stream: &mut S) -> Result<HandshakeResult>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    server_handshake_with_supported_protocols(stream, &[]).await
+}
+
+/// Perform a server-side handshake using supported subprotocols in server
+/// preference order.
+#[cfg(feature = "tokio-runtime")]
+pub async fn server_handshake_with_protocols<S, I, P>(
+    stream: &mut S,
+    protocols: I,
+) -> Result<HandshakeResult>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    I: IntoIterator<Item = P>,
+    P: Into<String>,
+{
+    let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+    validate_supported_protocols(&protocols)?;
+    server_handshake_with_supported_protocols(stream, &protocols).await
+}
+
+#[cfg(feature = "tokio-runtime")]
+pub(crate) async fn server_handshake_with_supported_protocols<S>(
+    stream: &mut S,
+    protocols: &[String],
+) -> Result<HandshakeResult>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = BytesMut::with_capacity(4096);
@@ -436,14 +491,14 @@ where
         if let Some((req, consumed)) = parse_request(&buf)? {
             // Extract values before mutably borrowing buf
             let path = req.path.to_string();
-            let protocol = req.protocol.map(String::from);
+            let protocol = select_subprotocol(req.protocol, protocols).map(str::to_owned);
             let extensions = req.extensions.map(String::from);
 
             // Generate accept key
             let accept_key = generate_accept_key(req.key);
 
             // Build and send response
-            let response = build_response(&accept_key, req.protocol, None);
+            let response = build_response(&accept_key, protocol.as_deref(), None);
             stream.write_all(&response).await?;
             stream.flush().await?;
 

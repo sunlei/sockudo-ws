@@ -29,12 +29,10 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 #[cfg(feature = "http3")]
 use std::net::SocketAddr;
-
-#[cfg(feature = "http3")]
-use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::protocol::Role;
@@ -95,7 +93,22 @@ use {
 /// Use `WebSocketServer<Http2>` for HTTP/2 or `WebSocketServer<Http3>` for HTTP/3.
 pub struct WebSocketServer<T: Transport> {
     config: Config,
+    protocols: Arc<[String]>,
     inner: ServerInner<T>,
+}
+
+impl<T: Transport> WebSocketServer<T> {
+    /// Set supported WebSocket subprotocols in server preference order.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+        handshake::validate_supported_protocols(&protocols)?;
+        self.protocols = protocols.into();
+        Ok(self)
+    }
 }
 
 // Server inner state - different for each transport
@@ -120,6 +133,7 @@ impl WebSocketServer<Http1> {
     pub fn new(config: Config) -> Self {
         Self {
             config,
+            protocols: Arc::default(),
             inner: ServerInner::Http1(PhantomData),
         }
     }
@@ -170,7 +184,9 @@ impl WebSocketServer<Http1> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result = handshake::server_handshake(&mut stream).await?;
+        let handshake_result =
+            handshake::server_handshake_with_supported_protocols(&mut stream, &self.protocols)
+                .await?;
 
         // Wrap in Stream<Http1>
         let stream = Stream::<Http1>::new(stream);
@@ -223,7 +239,9 @@ impl WebSocketServer<Http1> {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result = handshake::server_handshake(&mut stream).await?;
+        let handshake_result =
+            handshake::server_handshake_with_supported_protocols(&mut stream, &self.protocols)
+                .await?;
 
         // Preserve frame bytes read together with the HTTP upgrade request.
         let ws = WebSocketStream::from_raw_with_leftover(
@@ -266,10 +284,9 @@ impl WebSocketServer<Http1> {
             let (stream, _addr) = listener.accept().await.map_err(Error::Io)?;
 
             let handler = handler.clone();
-            let config = self.config.clone();
+            let server = self.clone();
 
             tokio::spawn(async move {
-                let server = WebSocketServer::<Http1>::new(config);
                 match server.accept(stream).await {
                     Ok((ws, handshake)) => {
                         handler(ws, handshake).await;
@@ -293,6 +310,7 @@ impl Clone for WebSocketServer<Http1> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            protocols: self.protocols.clone(),
             inner: ServerInner::Http1(PhantomData),
         }
     }
@@ -308,6 +326,7 @@ impl WebSocketServer<Http2> {
     pub fn new(config: Config) -> Self {
         Self {
             config,
+            protocols: Arc::default(),
             inner: ServerInner::Http2(PhantomData),
         }
     }
@@ -346,6 +365,7 @@ impl WebSocketServer<Http2> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let config = self.config.clone();
+        let protocols = self.protocols.clone();
 
         // Build h2 server connection with Extended CONNECT enabled
         let mut h2_builder = server::Builder::new();
@@ -366,9 +386,12 @@ impl WebSocketServer<Http2> {
 
             let handler = handler.clone();
             let config = config.clone();
+            let protocols = protocols.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_http2_request(request, respond, handler, config).await {
+                if let Err(e) =
+                    handle_http2_request(request, respond, handler, config, protocols).await
+                {
                     eprintln!("HTTP/2 WebSocket error: {}", e);
                 }
             });
@@ -397,6 +420,7 @@ impl WebSocketServer<Http2> {
         Filter: Fn(&ExtendedConnectRequest) -> bool + Clone + Send + 'static,
     {
         let config = self.config.clone();
+        let protocols = self.protocols.clone();
 
         let mut h2_builder = server::Builder::new();
 
@@ -415,10 +439,13 @@ impl WebSocketServer<Http2> {
             let handler = handler.clone();
             let filter = filter.clone();
             let config = config.clone();
+            let protocols = protocols.clone();
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_http2_request_filtered(request, respond, filter, handler, config).await
+                if let Err(e) = handle_http2_request_filtered(
+                    request, respond, filter, handler, config, protocols,
+                )
+                .await
                 {
                     eprintln!("HTTP/2 WebSocket error: {}", e);
                 }
@@ -441,6 +468,7 @@ impl Clone for WebSocketServer<Http2> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            protocols: self.protocols.clone(),
             inner: ServerInner::Http2(PhantomData),
         }
     }
@@ -456,6 +484,7 @@ async fn handle_http2_request<F, Fut>(
     mut respond: SendResponse<Bytes>,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(WebSocketStream<Stream<Http2>>, ExtendedConnectRequest) -> Fut + Send + 'static,
@@ -468,8 +497,9 @@ where
             ws_req.protocol = Some("websocket".to_string());
         }
 
-        // Accept the WebSocket upgrade
-        let response = build_extended_connect_response(ws_req.subprotocols.as_deref(), None);
+        let selected_protocol =
+            handshake::select_subprotocol(ws_req.subprotocols.as_deref(), &protocols);
+        let response = build_extended_connect_response(selected_protocol, None);
 
         let send_stream = respond
             .send_response(response, false)
@@ -505,6 +535,7 @@ async fn handle_http2_request_filtered<F, Fut, Filter>(
     filter: Filter,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(WebSocketStream<Stream<Http2>>, ExtendedConnectRequest) -> Fut + Send + 'static,
@@ -526,7 +557,9 @@ where
             return Ok(());
         }
 
-        let response = build_extended_connect_response(ws_req.subprotocols.as_deref(), None);
+        let selected_protocol =
+            handshake::select_subprotocol(ws_req.subprotocols.as_deref(), &protocols);
+        let response = build_extended_connect_response(selected_protocol, None);
 
         let send_stream = respond
             .send_response(response, false)
@@ -578,6 +611,7 @@ impl WebSocketServer<Http3> {
 
         Ok(Self {
             config: ws_config,
+            protocols: Arc::default(),
             inner: ServerInner::Http3 { endpoint },
         })
     }
@@ -590,6 +624,7 @@ impl WebSocketServer<Http3> {
     pub fn from_endpoint(endpoint: Endpoint, ws_config: Config) -> Self {
         Self {
             config: ws_config,
+            protocols: Arc::default(),
             inner: ServerInner::Http3 { endpoint },
         }
     }
@@ -625,6 +660,7 @@ impl WebSocketServer<Http3> {
             + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        let protocols = self.protocols.clone();
         let endpoint = match self.inner {
             ServerInner::Http3 { endpoint } => endpoint,
             _ => unreachable!(),
@@ -633,9 +669,11 @@ impl WebSocketServer<Http3> {
         while let Some(incoming) = endpoint.accept().await {
             let handler = handler.clone();
             let config = self.config.clone();
+            let protocols = protocols.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_http3_connection(incoming, handler, config).await {
+                if let Err(e) = handle_http3_connection(incoming, handler, config, protocols).await
+                {
                     eprintln!("HTTP/3 connection error: {}", e);
                 }
             });
@@ -660,6 +698,7 @@ impl WebSocketServer<Http3> {
         Fut: Future<Output = ()> + Send + 'static,
         Filter: Fn(&ExtendedConnectRequest) -> bool + Clone + Send + Sync + 'static,
     {
+        let protocols = self.protocols.clone();
         let endpoint = match self.inner {
             ServerInner::Http3 { endpoint } => endpoint,
             _ => unreachable!(),
@@ -669,10 +708,12 @@ impl WebSocketServer<Http3> {
             let handler = handler.clone();
             let filter = filter.clone();
             let config = self.config.clone();
+            let protocols = protocols.clone();
 
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_http3_connection_filtered(incoming, filter, handler, config).await
+                    handle_http3_connection_filtered(incoming, filter, handler, config, protocols)
+                        .await
                 {
                     eprintln!("HTTP/3 connection error: {}", e);
                 }
@@ -700,6 +741,7 @@ async fn handle_http3_connection<F, Fut>(
     incoming: quinn::Incoming,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(WebSocketStream<Stream<Http3>>, ExtendedConnectRequest) -> Fut + Clone + Send + 'static,
@@ -725,9 +767,12 @@ where
 
                 let handler = handler.clone();
                 let config = config.clone();
+                let protocols = protocols.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_http3_request(request, stream, handler, config).await {
+                    if let Err(e) =
+                        handle_http3_request(request, stream, handler, config, protocols).await
+                    {
                         eprintln!("HTTP/3 request error: {}", e);
                     }
                 });
@@ -746,6 +791,7 @@ async fn handle_http3_connection_filtered<F, Fut, Filter>(
     filter: Filter,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(WebSocketStream<Stream<Http3>>, ExtendedConnectRequest) -> Fut + Clone + Send + 'static,
@@ -773,11 +819,13 @@ where
                 let handler = handler.clone();
                 let filter = filter.clone();
                 let config = config.clone();
+                let protocols = protocols.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_http3_request_filtered(request, stream, filter, handler, config)
-                            .await
+                    if let Err(e) = handle_http3_request_filtered(
+                        request, stream, filter, handler, config, protocols,
+                    )
+                    .await
                     {
                         eprintln!("HTTP/3 request error: {}", e);
                     }
@@ -797,6 +845,7 @@ async fn handle_http3_request<F, Fut>(
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(WebSocketStream<Stream<Http3>>, ExtendedConnectRequest) -> Fut + Send + 'static,
@@ -838,7 +887,9 @@ where
         return Ok(());
     }
 
-    let response = build_extended_connect_response(None, None);
+    let selected_protocol =
+        handshake::select_subprotocol(ws_req.subprotocols.as_deref(), &protocols);
+    let response = build_extended_connect_response(selected_protocol, None);
     stream.send_response(response).await.map_err(Error::from)?;
 
     let h3_stream = Stream::<Http3>::from_h3_server(stream);
@@ -856,6 +907,7 @@ async fn handle_http3_request_filtered<F, Fut, Filter>(
     filter: Filter,
     handler: F,
     config: Config,
+    protocols: Arc<[String]>,
 ) -> Result<()>
 where
     F: Fn(WebSocketStream<Stream<Http3>>, ExtendedConnectRequest) -> Fut + Send + 'static,
@@ -900,7 +952,9 @@ where
         return Ok(());
     }
 
-    let response = build_extended_connect_response(None, None);
+    let selected_protocol =
+        handshake::select_subprotocol(ws_req.subprotocols.as_deref(), &protocols);
+    let response = build_extended_connect_response(selected_protocol, None);
     stream.send_response(response).await.ok();
 
     let h3_stream = Stream::<Http3>::from_h3_server(stream);
