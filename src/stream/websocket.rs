@@ -84,6 +84,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -145,6 +146,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -270,23 +272,10 @@ where
         let close = Message::Close(Some(CloseReason::new(code, reason)));
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
-        self.check_write_limit()?;
         self.state = StreamState::CloseSent;
 
         // Flush the close frame
         self.flush_write_buf().await?;
-        Ok(())
-    }
-
-    fn check_write_limit(&mut self) -> Result<()> {
-        if self.write_buf.pending_bytes() > self.config.max_backpressure {
-            // Rejected frames must not be sent by a later flush or close.
-            self.write_buf.clear();
-            self.state = StreamState::Closed;
-            self.heartbeat.stop();
-            self.heartbeat_sleep = None;
-            return Err(Error::BufferFull);
-        }
         Ok(())
     }
 
@@ -395,9 +384,6 @@ where
 
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state == StreamState::Closed {
-            return Poll::Ready(Err(Error::ConnectionClosed));
-        }
         let this = self.as_mut().get_mut();
 
         // Write all pending data
@@ -677,9 +663,22 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        // Drain before accepting more data; a single message may exceed the
+        // threshold. Bypass batch coalescing so readiness applies backpressure.
+        if self.write_buf.has_data()
+            && self.write_buf.pending_bytes() >= self.config.max_backpressure
+        {
+            self.ready_flush_pending = true;
+        }
+        // Partial writes may bring queued bytes below the threshold before the
+        // transport is drained. Continue that flush across subsequent polls.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -719,7 +718,7 @@ where
                         None,
                     );
                     this.write_buf.push_segment(payload.clone());
-                    return this.check_write_limit();
+                    return Ok(());
                 }
                 _ => {}
             }
@@ -728,7 +727,7 @@ where
         // Encode message into write buffer
         this.protocol
             .encode_message(&item, this.write_buf.buffer_mut())?;
-        this.check_write_limit()
+        Ok(())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -971,7 +970,6 @@ struct SplitSink<W, E> {
     writer: W,
     encoder: E,
     buf: BytesMut,
-    max_backpressure: usize,
 }
 
 type SharedSink<W, E> = Arc<tokio::sync::Mutex<SplitSink<W, E>>>;
@@ -981,12 +979,11 @@ where
     W: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    fn new(writer: W, encoder: E, capacity: usize, max_backpressure: usize) -> Self {
+    fn new(writer: W, encoder: E, capacity: usize) -> Self {
         Self {
             writer,
             encoder,
             buf: BytesMut::with_capacity(capacity),
-            max_backpressure,
         }
     }
 
@@ -1029,20 +1026,14 @@ where
         if is_close {
             self.shared.begin_closing();
         }
-        let limit = sink.max_backpressure;
         let result = sink
             .write_frame(&self.shared.cancel, |encoder, buf| {
-                encoder.encode_message(&msg, buf)?;
-                if buf.len() > limit {
-                    return Err(Error::BufferFull);
-                }
-                Ok(())
+                encoder.encode_message(&msg, buf)
             })
             .await;
         drop(sink);
         if result.is_err() {
             self.shared.terminate(TerminalCause::ConnectionClosed);
-            self.shared.cancel.cancel();
             return result;
         }
         if is_close {
@@ -1131,13 +1122,9 @@ where
             self.config.max_frame_size,
             self.config.max_message_size,
         );
-        let sink: SharedSink<WriteHalf<S>, Protocol> =
-            Arc::new(tokio::sync::Mutex::new(SplitSink::new(
-                writer,
-                self.protocol,
-                self.config.write_buffer_size,
-                self.config.max_backpressure,
-            )));
+        let sink: SharedSink<WriteHalf<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
+            SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
+        ));
 
         tokio::spawn(split_writer_driver(
             sink.clone(),
@@ -1582,6 +1569,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -1619,6 +1607,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -1651,6 +1640,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -1686,22 +1676,9 @@ where
         let close = Message::Close(Some(CloseReason::new(code, reason)));
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
-        self.check_write_limit()?;
         self.state = StreamState::CloseSent;
 
         self.flush_write_buf().await?;
-        Ok(())
-    }
-
-    fn check_write_limit(&mut self) -> Result<()> {
-        if self.write_buf.pending_bytes() > self.config.max_backpressure {
-            // Rejected frames must not be sent by a later flush or close.
-            self.write_buf.clear();
-            self.state = StreamState::Closed;
-            self.heartbeat.stop();
-            self.heartbeat_sleep = None;
-            return Err(Error::BufferFull);
-        }
         Ok(())
     }
 
@@ -1804,9 +1781,6 @@ where
 
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state == StreamState::Closed {
-            return Poll::Ready(Err(Error::ConnectionClosed));
-        }
         let this = self.as_mut().get_mut();
 
         while this.write_buf.has_data() {
@@ -2059,9 +2033,22 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        // Drain before accepting more data; a single message may exceed the
+        // threshold. Bypass batch coalescing so readiness applies backpressure.
+        if self.write_buf.has_data()
+            && self.write_buf.pending_bytes() >= self.config.max_backpressure
+        {
+            self.ready_flush_pending = true;
+        }
+        // Partial writes may bring queued bytes below the threshold before the
+        // transport is drained. Continue that flush across subsequent polls.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -2081,7 +2068,7 @@ where
 
         this.protocol
             .encode_message(&item, this.write_buf.buffer_mut())?;
-        this.check_write_limit()
+        Ok(())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -2224,7 +2211,6 @@ where
             writer,
             writer_protocol,
             self.config.write_buffer_size,
-            self.config.max_backpressure,
         )));
 
         tokio::spawn(split_writer_driver(
@@ -2645,11 +2631,7 @@ mod tests {
     #[tokio::test]
     async fn blocked_split_writer_is_cancelled_when_reader_drops() {
         let (client_io, _peer_io) = tokio::io::duplex(64);
-        let config = Config::builder()
-            .auto_ping(false)
-            .idle_timeout(0)
-            .max_backpressure(2 * 1024 * 1024)
-            .build();
+        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
         let (reader, mut writer) = WebSocketStream::client(client_io, config).split();
         let send = tokio::spawn(async move {
             writer
