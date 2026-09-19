@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        include: [{"case": "pr-20", "sha": "dadaad903c4abfc2869da9d0a967adffd4e1312b"}, {"case": "pr-21", "sha": "915e83a9ad912963f762f40c7934553db7043230"}, {"case": "pr-23", "sha": "62eda5ea46b8b97102f00331528fb6c09b793181"}, {"case": "pr-26", "sha": "116499d1607825f35912a96c95a9d4615429988f"}, {"case": "pr-28", "sha": "ae2c47e48f018c766b2ba891374671646edf9ca0"}, {"case": "pr-30", "sha": "cd6b43c9f9ddcfb53560bcbd31c45f647ef126de"}, {"case": "pr-32", "sha": "0fa8b48dc1652cf5eedce6a75305f4b366b81c6b"}, {"case": "pr-33", "sha": "8ae2e74d25621a71898110af7d4cde7621cca925"}, {"case": "pr-34", "sha": "16482d5bb6b7902ef444ba17efb66cef9b4d53d0"}, {"case": "pr-35", "sha": "f70f30891dcd2eec458a18cc529c9bee2424256b"}, {"case": "pr-36", "sha": "4178e695529edaeede0076153eee21de0c8458c4"}, {"case": "pr-37", "sha": "e88c4ccb9f2215abd375039cb75e19eaa7e8a489"}, {"case": "pr-38", "sha": "babb334a67af4da37deda6ddebc8a70a812e1ef5"}, {"case": "pr-40", "sha": "7b24cb47fa49ba943657978f19c684c977c79b98"}, {"case": "pr-43", "sha": "41af790181f10741b2dbdf85c58955eec1ac1b23"}, {"case": "pr-44", "sha": "039cb1b47d95f81d0634cc175de5e71abc65fc57"}, {"case": "pr-45", "sha": "dd94f905fb31cab5cb557701d03189656c59aec7"}, {"case": "pr-46", "sha": "931e54bb49e82d52a0c2c3309375d8f6f63893ae"}, {"case": "pr-47", "sha": "2848525afc07edc0c55de0d89837272aa17f131a"}, {"case": "pr-48", "sha": "044ed90d42c4fa9bb1a96f79c9c0c335e05a0972"}, {"case": "pr-51", "sha": "5b19c3c0f1608a097efa4ee58ad56c265a587a3c"}, {"case": "pr-52", "sha": "eabd06574a1c11235e3facda3e3ffa858e715f17"}, {"case": "pr-55", "sha": "fdc9f226f4843cb592005d21f15f833a3f5836a7"}, {"case": "pr-58", "sha": "b4d9e793f27a414c5d0392a394cd2c503a93ebc7"}, {"case": "pr-68", "sha": "49534dd2baeb9aa7b108b89278c81d7e99748839"}, {"case": "pr-69", "sha": "a0029f8ff7473518d19693cfcaa7533b05fe970e"}]
+        include: [{"case": "pr-36", "sha": "e9e09aa66f2172bfc1364137c8fb761f13d22d2c"}, {"case": "pr-45", "sha": "dd94f905fb31cab5cb557701d03189656c59aec7"}, {"case": "pr-67", "sha": "4bcd88092c87905d98c5de6181fc30d683d90e58"}]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,11 +37,20 @@ jobs:
           import json, os
           from pathlib import Path
           root = Path("autobahn-validation")
-          root.joinpath("config.json").write_text(json.dumps({
-              "outdir": "/reports",
-              "servers": [{"agent": os.environ["CASE"] + "-" + os.environ["REVISION"][:12], "url": "ws://127.0.0.1:9001"}],
-              "cases": ["*"], "exclude-cases": [], "exclude-agent-cases": {}
-          }))
+          # The pinned image's full catalog has 517 cases. Restart the Python 2
+          # process between families after a complete run was OOM-killed.
+          groups = {"1": 16, "2": 11, "3": 7, "4": 10, "5": 20, "6": 145,
+                    "7": 37, "9": 54, "10": 1, "12": 90,
+                    **{f"13.{part}": 18 for part in range(1, 8)}}
+          root.joinpath("groups.json").write_text(json.dumps(groups))
+          root.joinpath("groups.txt").write_text("\n".join(groups) + "\n")
+          for group in groups:
+              root.joinpath("reports", group).mkdir(parents=True, exist_ok=True)
+              root.joinpath(f"config-{group}.json").write_text(json.dumps({
+                  "outdir": "/reports",
+                  "servers": [{"agent": os.environ["CASE"] + "-" + os.environ["REVISION"][:12], "url": "ws://127.0.0.1:9001"}],
+                  "cases": [group + ".*"], "exclude-cases": [], "exclude-agent-cases": {}
+              }))
           root.joinpath("revision.txt").write_text(os.environ["REVISION"] + "\n")
           PYTHON
           ./target/release/autobahn-server > autobahn-validation/server.log 2>&1 &
@@ -58,15 +67,21 @@ jobs:
           else:
               raise SystemExit("echo server did not become ready")
           PYTHON
-          set +e
-          docker run --name autobahn-suite --network host -e PYTHONUNBUFFERED=1 \
-            -v "$PWD/autobahn-validation:/config:ro" \
-            -v "$PWD/autobahn-validation/reports:/reports" \
-            crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074 \
-            wstest -m fuzzingclient -s /config/config.json > autobahn-validation/suite.log 2>&1
-          suite_status=$?
-          set -e
-          docker inspect autobahn-suite > autobahn-validation/container-state.json
+          suite_status=0
+          while IFS= read -r group; do
+            set +e
+            docker run --name "autobahn-suite-$group" --network host -e PYTHONUNBUFFERED=1 \
+              -v "$PWD/autobahn-validation:/config:ro" \
+              -v "$PWD/autobahn-validation/reports/$group:/reports" \
+              crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074 \
+              wstest -m fuzzingclient -s "/config/config-$group.json" > "autobahn-validation/suite-$group.log" 2>&1
+            group_status=$?
+            set -e
+            docker inspect "autobahn-suite-$group" > "autobahn-validation/container-state-$group.json"
+            if (( group_status != 0 )); then
+              suite_status=$group_status
+            fi
+          done < autobahn-validation/groups.txt
           exit "$suite_status"
       - name: Classify report results
         if: always()
@@ -74,26 +89,38 @@ jobs:
           python3 - <<'PYTHON'
           import collections, json, os
           from pathlib import Path
-          report = Path("autobahn-validation/reports/index.json")
-          if not report.exists():
-              raise SystemExit("Autobahn report missing; no passing result")
-          data = json.loads(report.read_text())
+          root = Path("autobahn-validation")
+          groups = json.loads(root.joinpath("groups.json").read_text())
           acceptable = {"OK", "NON-STRICT", "INFORMATIONAL"}
           failures = []
           summary = []
-          for agent, cases in data.items():
-              behaviors = collections.Counter(row.get("behavior", "MISSING") for row in cases.values())
-              closes = collections.Counter(row.get("behaviorClose", "MISSING") for row in cases.values())
-              summary.append(f"{agent}: {len(cases)} cases; behavior={dict(behaviors)}; close={dict(closes)}")
-              for number, row in cases.items():
-                  if row.get("behavior") not in acceptable or row.get("behaviorClose") not in acceptable:
-                      failures.append((agent, number, row.get("behavior"), row.get("behaviorClose")))
+          seen = set()
+          for group, expected in groups.items():
+              report = root.joinpath("reports", group, "index.json")
+              if not report.exists():
+                  failures.append((group, "missing report"))
+                  continue
+              data = json.loads(report.read_text())
+              if len(data) != 1:
+                  failures.append((group, "expected exactly one agent"))
+              for agent, cases in data.items():
+                  if len(cases) != expected or seen.intersection(cases):
+                      failures.append((group, "incomplete or duplicated case coverage"))
+                  seen.update(cases)
+                  behaviors = collections.Counter(row.get("behavior", "MISSING") for row in cases.values())
+                  closes = collections.Counter(row.get("behaviorClose", "MISSING") for row in cases.values())
+                  summary.append(f"{agent} group {group}: {len(cases)} cases; behavior={dict(behaviors)}; close={dict(closes)}")
+                  for number, row in cases.items():
+                      if row.get("behavior") not in acceptable or row.get("behaviorClose") not in acceptable:
+                          failures.append((agent, number, row.get("behavior"), row.get("behaviorClose")))
+          if len(seen) != 517:
+              failures.append(("total", f"expected 517 unique cases, got {len(seen)}"))
           text = "\n".join(summary) + "\n\nUnexpected or unimplemented results: " + repr(failures) + "\n"
           print(text)
           Path("autobahn-validation/summary.txt").write_text(text)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
               output.write(text)
-          if not data or failures:
+          if failures:
               raise SystemExit(1)
           PYTHON
       - uses: actions/upload-artifact@v4
