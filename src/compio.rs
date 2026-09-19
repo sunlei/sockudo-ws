@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", feature = "http3"))]
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -421,6 +421,88 @@ type CompioH3ServerRequestStream = h3::server::RequestStream<CompioH3BidiStream,
 #[cfg(feature = "http3")]
 type CompioH3SendRequest = h3::client::SendRequest<::compio::quic::h3::OpenStreams, Bytes>;
 
+#[cfg(feature = "http3")]
+type CompioH3WriteFuture<S> =
+    Pin<Box<dyn Future<Output = (S, std::result::Result<(), h3::error::StreamError>)> + 'static>>;
+
+#[cfg(feature = "http3")]
+trait CompioH3SendStream: Sized + 'static {
+    fn send_data(self, data: Bytes) -> CompioH3WriteFuture<Self>;
+}
+
+#[cfg(feature = "http3")]
+impl CompioH3SendStream for CompioH3ClientRequestStream {
+    fn send_data(mut self, data: Bytes) -> CompioH3WriteFuture<Self> {
+        Box::pin(async move {
+            let result = h3::client::RequestStream::send_data(&mut self, data).await;
+            (self, result)
+        })
+    }
+}
+
+#[cfg(feature = "http3")]
+impl CompioH3SendStream for CompioH3ServerRequestStream {
+    fn send_data(mut self, data: Bytes) -> CompioH3WriteFuture<Self> {
+        Box::pin(async move {
+            let result = h3::server::RequestStream::send_data(&mut self, data).await;
+            (self, result)
+        })
+    }
+}
+
+/// Keeps an accepted HTTP/3 DATA write alive if its caller is cancelled.
+#[cfg(feature = "http3")]
+struct CompioH3Writer<S> {
+    stream: Option<S>,
+    pending_write: Option<CompioH3WriteFuture<S>>,
+}
+
+#[cfg(feature = "http3")]
+impl<S: CompioH3SendStream> CompioH3Writer<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: Some(stream),
+            pending_write: None,
+        }
+    }
+
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        if buf.as_init().is_empty() {
+            return BufResult(Ok(0), buf);
+        }
+        if let Err(error) = self.flush().await {
+            return BufResult(Err(error), buf);
+        }
+
+        let bytes = buf.as_init();
+        let len = bytes.len();
+        let data = Bytes::copy_from_slice(bytes);
+        let stream = self
+            .stream
+            .take()
+            .expect("Compio HTTP/3 send stream missing without a pending write");
+        self.pending_write = Some(stream.send_data(data));
+        BufResult(Ok(len), buf)
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        let Some(write) = self.pending_write.as_mut() else {
+            return Ok(());
+        };
+
+        let (stream, result) = write.await;
+        self.stream = Some(stream);
+        self.pending_write = None;
+        result.map_err(io::Error::other)
+    }
+
+    fn stream_mut(&mut self) -> &mut S {
+        self.stream
+            .as_mut()
+            .expect("Compio HTTP/3 send stream missing after flushing pending writes")
+    }
+}
+
 /// HTTP/2 stream exposed through native Compio I/O traits.
 #[cfg(feature = "http2")]
 pub struct CompioHttp2Stream {
@@ -731,7 +813,7 @@ where
 /// HTTP/3 client stream exposed through native Compio I/O traits.
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ClientStream {
-    stream: CompioH3ClientRequestStream,
+    writer: CompioH3Writer<CompioH3ClientRequestStream>,
     recv_buf: BytesMut,
     _endpoint: Option<::compio::quic::Endpoint>,
     _send_request: Option<CompioH3SendRequest>,
@@ -746,7 +828,7 @@ impl CompioHttp3ClientStream {
         send_request: Option<CompioH3SendRequest>,
     ) -> Self {
         Self {
-            stream,
+            writer: CompioH3Writer::new(stream),
             recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
             _endpoint: endpoint,
             _send_request: send_request,
@@ -758,7 +840,10 @@ impl CompioHttp3ClientStream {
 impl AsyncRead for CompioHttp3ClientStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         if self.recv_buf.is_empty() {
-            match self.stream.recv_data().await {
+            if let Err(error) = self.writer.flush().await {
+                return BufResult(Err(error), buf);
+            }
+            match self.writer.stream_mut().recv_data().await {
                 Ok(Some(mut data)) => {
                     while data.has_remaining() {
                         let chunk = data.chunk();
@@ -780,32 +865,27 @@ impl AsyncRead for CompioHttp3ClientStream {
 #[cfg(feature = "http3")]
 impl AsyncWrite for CompioHttp3ClientStream {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
-        let bytes = buf.as_init();
-        if bytes.is_empty() {
-            return BufResult(Ok(0), buf);
-        }
-
-        let len = bytes.len();
-        let data = Bytes::copy_from_slice(bytes);
-        match self.stream.send_data(data).await {
-            Ok(()) => BufResult(Ok(len), buf),
-            Err(e) => BufResult(Err(io::Error::other(e)), buf),
-        }
+        self.writer.write(buf).await
     }
 
     async fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.writer.flush().await
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        self.stream.finish().await.map_err(io::Error::other)
+        self.writer.flush().await?;
+        self.writer
+            .stream_mut()
+            .finish()
+            .await
+            .map_err(io::Error::other)
     }
 }
 
 /// HTTP/3 server stream exposed through native Compio I/O traits.
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ServerStream {
-    stream: CompioH3ServerRequestStream,
+    writer: CompioH3Writer<CompioH3ServerRequestStream>,
     recv_buf: BytesMut,
 }
 
@@ -814,7 +894,7 @@ impl CompioHttp3ServerStream {
     /// Create a Compio HTTP/3 server stream after Extended CONNECT.
     pub fn new(stream: CompioH3ServerRequestStream) -> Self {
         Self {
-            stream,
+            writer: CompioH3Writer::new(stream),
             recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
         }
     }
@@ -824,7 +904,10 @@ impl CompioHttp3ServerStream {
 impl AsyncRead for CompioHttp3ServerStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         if self.recv_buf.is_empty() {
-            match self.stream.recv_data().await {
+            if let Err(error) = self.writer.flush().await {
+                return BufResult(Err(error), buf);
+            }
+            match self.writer.stream_mut().recv_data().await {
                 Ok(Some(mut data)) => {
                     while data.has_remaining() {
                         let chunk = data.chunk();
@@ -846,25 +929,20 @@ impl AsyncRead for CompioHttp3ServerStream {
 #[cfg(feature = "http3")]
 impl AsyncWrite for CompioHttp3ServerStream {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
-        let bytes = buf.as_init();
-        if bytes.is_empty() {
-            return BufResult(Ok(0), buf);
-        }
-
-        let len = bytes.len();
-        let data = Bytes::copy_from_slice(bytes);
-        match self.stream.send_data(data).await {
-            Ok(()) => BufResult(Ok(len), buf),
-            Err(e) => BufResult(Err(io::Error::other(e)), buf),
-        }
+        self.writer.write(buf).await
     }
 
     async fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.writer.flush().await
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        self.stream.finish().await.map_err(io::Error::other)
+        self.writer.flush().await?;
+        self.writer
+            .stream_mut()
+            .finish()
+            .await
+            .map_err(io::Error::other)
     }
 }
 
