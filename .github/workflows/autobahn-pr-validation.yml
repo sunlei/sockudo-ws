@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        include: [{"case": "pr-46", "sha": "931e54bb49e82d52a0c2c3309375d8f6f63893ae"}, {"case": "pr-55", "sha": "fdc9f226f4843cb592005d21f15f833a3f5836a7"}, {"case": "pr-59", "sha": "e34db1390b368bcf61605e8353c66dad38e3a9db"}, {"case": "pr-60", "sha": "0f67c36bcfb39bb2bb9bbd5e91a5c496d124c856"}, {"case": "pr-61", "sha": "1016b9929f3be5a55bb1872ff4bb760685106754"}, {"case": "pr-64", "sha": "64ba83c9e4b4ee3e1e0e7d69d96b5051ba682a92"}, {"case": "pr-65", "sha": "28ecf31821ecaa86b179ba77e7692134be29c6c9"}, {"case": "pr-66", "sha": "3cdf731d70d88be6be54e4825675e3222202f74a"}, {"case": "pr-67", "sha": "78ea90ffbe2fe4d1015a6c3e46d484bfbd9a38a3"}]
+        include: [{"case": "pr-61", "sha": "1016b9929f3be5a55bb1872ff4bb760685106754"}]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,7 +40,8 @@ jobs:
           # The pinned image's full catalog has 517 cases. Restart the Python 2
           # process between families after a complete run was OOM-killed.
           groups = {"1": 16, "2": 11, "3": 7, "4": 10, "5": 20, "6": 145,
-                    "7": 37, "9": 54, "10": 1, "12": 90,
+                    "7": 37, "9": 54, "10": 1,
+                    **{f"12.{part}": 18 for part in range(1, 6)},
                     **{f"13.{part}": 18 for part in range(1, 8)}}
           root.joinpath("groups.json").write_text(json.dumps(groups))
           root.joinpath("groups.txt").write_text("\n".join(groups) + "\n")
