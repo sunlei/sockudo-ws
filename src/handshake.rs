@@ -61,6 +61,9 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             if req.method != Some("GET") {
                 return Err(Error::InvalidHttp("method must be GET"));
             }
+            if req.version != Some(1) {
+                return Err(Error::InvalidHttp("HTTP version must be 1.1"));
+            }
 
             // Extract required headers
             let mut key = None;
@@ -75,7 +78,8 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             for header in req.headers.iter() {
                 let name = header.name;
                 let value = std::str::from_utf8(header.value)
-                    .map_err(|_| Error::InvalidHttp("invalid header value"))?;
+                    .map_err(|_| Error::InvalidHttp("invalid header value"))?
+                    .trim_matches([' ', '\t']);
 
                 // Case-insensitive comparisons without allocating per header.
                 if name.eq_ignore_ascii_case("sec-websocket-key") {
@@ -110,9 +114,15 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             }
             let key = key.ok_or(Error::HandshakeFailed("missing Sec-WebSocket-Key"))?;
             let version = version.ok_or(Error::HandshakeFailed("missing Sec-WebSocket-Version"))?;
+            let host = host
+                .filter(|value| !value.is_empty())
+                .ok_or(Error::HandshakeFailed("missing Host"))?;
 
             if version != "13" {
                 return Err(Error::HandshakeFailed("unsupported WebSocket version"));
+            }
+            if !is_valid_websocket_key(key) {
+                return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Key"));
             }
 
             let path = req.path.unwrap_or("/");
@@ -120,7 +130,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             Ok(Some((
                 HandshakeRequest {
                     path,
-                    host,
+                    host: Some(host),
                     key,
                     version,
                     protocol,
@@ -142,6 +152,13 @@ fn has_token_ignore_case(value: &str, token: &str) -> bool {
     value
         .split(',')
         .any(|part| part.trim().eq_ignore_ascii_case(token))
+}
+
+fn is_valid_websocket_key(value: &str) -> bool {
+    let mut decoded = [0; 24];
+    base64::engine::general_purpose::STANDARD
+        .decode_slice(value, &mut decoded)
+        .is_ok_and(|len| len == 16)
 }
 
 /// Generate the Sec-WebSocket-Accept key
@@ -368,6 +385,9 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
         Ok(httparse::Status::Complete(len)) => {
             let status = res.code.unwrap_or(0);
 
+            if res.version != Some(1) {
+                return Err(Error::InvalidHttp("HTTP version must be 1.1"));
+            }
             if status != 101 {
                 return Err(Error::HandshakeFailed("expected 101 Switching Protocols"));
             }
@@ -375,11 +395,14 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
             let mut accept = None;
             let mut protocol = None;
             let mut extensions = None;
+            let mut upgrade = false;
+            let mut connection_upgrade = false;
 
             for header in res.headers.iter() {
                 let name = header.name;
                 let value = std::str::from_utf8(header.value)
-                    .map_err(|_| Error::InvalidHttp("invalid header value"))?;
+                    .map_err(|_| Error::InvalidHttp("invalid header value"))?
+                    .trim_matches([' ', '\t']);
 
                 if name.eq_ignore_ascii_case("sec-websocket-accept") {
                     accept = Some(value);
@@ -387,7 +410,18 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                     protocol = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
                     extensions = Some(value);
+                } else if name.eq_ignore_ascii_case("upgrade") {
+                    upgrade |= has_token_ignore_case(value, "websocket");
+                } else if name.eq_ignore_ascii_case("connection") {
+                    connection_upgrade |= has_token_ignore_case(value, "upgrade");
                 }
+            }
+
+            if !upgrade {
+                return Err(Error::HandshakeFailed("missing Upgrade: websocket"));
+            }
+            if !connection_upgrade {
+                return Err(Error::HandshakeFailed("missing Connection: Upgrade"));
             }
 
             Ok(Some((
