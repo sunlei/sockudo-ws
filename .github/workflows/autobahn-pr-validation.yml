@@ -1,0 +1,98 @@
+name: Autobahn PR validation
+on:
+  push:
+    branches: [sunlei/autobahn-pr-validation]
+permissions:
+  contents: read
+jobs:
+  conformance:
+    name: ${{ matrix.case }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: [{"case": "baseline", "sha": "82f2ddb8108f161ba066d03310ff912543c96a47"}, {"case": "pr-19", "sha": "534ff1953221fd2ef1f7e5c8ef71934f07386ff7"}, {"case": "pr-20", "sha": "3536e28a55cb2078bb1e7a92506f7ff63b49c35e"}, {"case": "pr-21", "sha": "91c52464a42e50d04c58466b19a099da07ccd607"}, {"case": "pr-22", "sha": "6c9a751dad15415747c72c4c05e77b300b83c312"}, {"case": "pr-23", "sha": "62eda5ea46b8b97102f00331528fb6c09b793181"}, {"case": "pr-24", "sha": "858de6e9463878539e010c9930da1c7762c21c42"}, {"case": "pr-25", "sha": "5bd983628cf4a1a194c98d08e92944a68c46def8"}, {"case": "pr-26", "sha": "116499d1607825f35912a96c95a9d4615429988f"}, {"case": "pr-27", "sha": "d2cd366054e7c1b992d3d5f47751ca91e336ccda"}, {"case": "pr-28", "sha": "7547ad0340407b5aa17c4f42aa396568c94b78a3"}, {"case": "pr-29", "sha": "30faddaaed66330f73bd2e2dadc5dd87ae330c4c"}, {"case": "pr-30", "sha": "b34a8d8b39da99c1bcbad84f3de87b1002742369"}, {"case": "pr-31", "sha": "0867eedb5303b559a46ee973dcc216f7bb0f64e4"}, {"case": "pr-32", "sha": "2e3afeac606b2b32934c061e06a9566a1b8d2d9a"}, {"case": "pr-33", "sha": "c7995ddf954f161f416c8f6f3ef8d0eff0ad7abc"}, {"case": "pr-34", "sha": "a012047c6f48d135563a78baebb61c268e08408d"}, {"case": "pr-35", "sha": "ccf4005a10dedbabf053652eb8da0ff453fb6674"}, {"case": "pr-36", "sha": "a0864382b7639b5fe3603c66c1f611b1a177a3af"}, {"case": "pr-37", "sha": "9dd96cae1318297d29ca5f166ba0ccbafbe3dfc5"}, {"case": "pr-38", "sha": "566da7582520cc651d98f48d333a2ec6286b2a94"}, {"case": "pr-39", "sha": "f02124264b70b8b319d0d519a10e95de55b93ebc"}, {"case": "pr-40", "sha": "c5ed7897f1078550de5ae6b732098db19a0264f6"}, {"case": "pr-41", "sha": "e7cb6d863728e5f852f9e868cf803e80a6b6c19e"}, {"case": "pr-42", "sha": "07d62fbe83fc2a7f987b82cb405b9102d8e402aa"}, {"case": "pr-43", "sha": "b673103f4b9b04bb2c911a250c6e396c3c1e295a"}, {"case": "pr-44", "sha": "0ec677e71b7430086ab177a406abb51027e58608"}, {"case": "pr-45", "sha": "2f90beeef934dd3f381adfffee983054de14a66e"}, {"case": "pr-46", "sha": "2d873604c410a9584e40dc0a69c646d42f2476b5"}, {"case": "pr-47", "sha": "0edc8112afb1801cdb0333f8215f02f7aff3b2d7"}, {"case": "pr-48", "sha": "8ab0c973afff74d9f2ad7ab9be1740ecc9f840be"}, {"case": "pr-49", "sha": "197e35bb0954d29a03ff10a5a8bec868504e871f"}, {"case": "pr-50", "sha": "7b6f3f03ccd1f71a4e39e20ff07a59cd5eda4eed"}, {"case": "pr-51", "sha": "cdbfc562b7935a7166221599ea0bdc10c5706f27"}, {"case": "pr-52", "sha": "8646cf7e6334c262d7d76b8bca38856fb0dcf4d8"}, {"case": "pr-53", "sha": "8d57ead2aa9b67a184388e3edd158bb5b9f364a5"}, {"case": "pr-54", "sha": "d2df6a6daadd361cf32e141fc2f60b6b76c16299"}, {"case": "pr-55", "sha": "f2d72c23ec06e85269488195499f395d9e9c6107"}, {"case": "pr-56", "sha": "31eb7c23452d03aa02389823aaffb0a34ce82682"}, {"case": "pr-57", "sha": "b9bf3e28e792ff2a0d9c149d404cfe9988c214f0"}, {"case": "pr-58", "sha": "b28430a9b43f00d57b10f51b1364e74e1ce9ec1b"}, {"case": "pr-59", "sha": "00d8433cc11b47ca17281a56d5d79ba9f7b8e747"}, {"case": "pr-60", "sha": "1052bcc7b45cc05507d7f0fc2f85253244912da8"}, {"case": "pr-61", "sha": "97046578072c6a1eb116ae3c5cba72a1d1b97352"}, {"case": "pr-62", "sha": "af86cf46babdf5a7640c6abcb1a912f23d27cc4f"}, {"case": "pr-63", "sha": "8c8f7182f3b1d2e2a58171e5606f2cf75f61dbdc"}, {"case": "pr-64", "sha": "17cc28b98f6671c3ae485feb16c8817515de324f"}, {"case": "pr-65", "sha": "4a5eec3eb14afa2e44f96afb28868d7c039a8193"}, {"case": "pr-66", "sha": "4a48a65e209944e294849f7c414cee0b5ba79248"}, {"case": "pr-67", "sha": "eb7353716e3729652de893c876604d71ddc0dba3"}]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sunlei/sockudo-ws
+          ref: ${{ matrix.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build protocol echo server
+        run: |
+          cargo build --release --bin autobahn-server --features permessage-deflate
+          mkdir -p autobahn-validation
+          cp Cargo.lock autobahn-validation/Cargo.lock
+          rustc -Vv > autobahn-validation/toolchain.txt
+          sha256sum target/release/autobahn-server > autobahn-validation/binary.sha256
+      - name: Run complete Autobahn suite
+        env:
+          CASE: ${{ matrix.case }}
+          REVISION: ${{ matrix.sha }}
+        run: |
+          mkdir -p autobahn-validation/reports
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          root = Path("autobahn-validation")
+          root.joinpath("config.json").write_text(json.dumps({
+              "outdir": "/reports",
+              "servers": [{"agent": os.environ["CASE"] + "-" + os.environ["REVISION"][:12], "url": "ws://127.0.0.1:9001"}],
+              "cases": ["*"], "exclude-cases": [], "exclude-agent-cases": {}
+          }))
+          root.joinpath("revision.txt").write_text(os.environ["REVISION"] + "\n")
+          PYTHON
+          ./target/release/autobahn-server > autobahn-validation/server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          python3 - <<'PYTHON'
+          import socket, time
+          for attempt in range(50):
+              try:
+                  with socket.create_connection(("127.0.0.1", 9001), timeout=1):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("echo server did not become ready")
+          PYTHON
+          docker run --network host -e PYTHONUNBUFFERED=1 \
+            -v "$PWD/autobahn-validation:/config:ro" \
+            -v "$PWD/autobahn-validation/reports:/reports" \
+            crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074 \
+            wstest -m fuzzingclient -s /config/config.json > autobahn-validation/suite.log 2>&1
+      - name: Classify report results
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          import collections, json, os
+          from pathlib import Path
+          report = Path("autobahn-validation/reports/index.json")
+          if not report.exists():
+              raise SystemExit("Autobahn report missing; no passing result")
+          data = json.loads(report.read_text())
+          acceptable = {"OK", "NON-STRICT", "INFORMATIONAL"}
+          failures = []
+          summary = []
+          for agent, cases in data.items():
+              behaviors = collections.Counter(row.get("behavior", "MISSING") for row in cases.values())
+              closes = collections.Counter(row.get("behaviorClose", "MISSING") for row in cases.values())
+              summary.append(f"{agent}: {len(cases)} cases; behavior={dict(behaviors)}; close={dict(closes)}")
+              for number, row in cases.items():
+                  if row.get("behavior") not in acceptable or row.get("behaviorClose") not in acceptable:
+                      failures.append((agent, number, row.get("behavior"), row.get("behaviorClose")))
+          text = "\n".join(summary) + "\n\nUnexpected or unimplemented results: " + repr(failures) + "\n"
+          print(text)
+          Path("autobahn-validation/summary.txt").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(text)
+          if not data or failures:
+              raise SystemExit(1)
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: autobahn-${{ matrix.case }}-${{ matrix.sha }}
+          path: autobahn-validation/
