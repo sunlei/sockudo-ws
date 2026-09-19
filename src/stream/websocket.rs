@@ -953,6 +953,8 @@ enum ControlRequest {
     Ping(Bytes, Instant),
     Pong(Bytes, Instant),
     PeerClose,
+    /// Start the application Close budget before it waits behind driver work.
+    LocalCloseStarted(tokio::time::Instant),
     Eof,
 }
 
@@ -978,7 +980,6 @@ struct SplitShared {
     /// Clock epoch shared by the reader and the writer driver
     clock_epoch: Instant,
     track_activity: bool,
-    close_timeout: Duration,
     /// Milliseconds since `clock_epoch` of the last inbound data frame (reader -> driver)
     // A standalone value, not a publication barrier for other shared memory.
     /// Milliseconds since `clock_epoch` of the last inbound data frame (reader -> driver)
@@ -987,6 +988,9 @@ struct SplitShared {
     terminal_tx: watch::Sender<Option<TerminalCause>>,
     // One native reader per connection. Keep registration across cancelled reads.
     reader_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    // Writer methods require exclusive access, so at most one application
+    // request can have crossed the encoder boundary.
+    application_started: AtomicBool,
     cancelled: AtomicBool,
     cancel: CancellationToken,
 }
@@ -996,13 +1000,13 @@ impl SplitShared {
         let (terminal_tx, _) = watch::channel(closed.then_some(TerminalCause::ConnectionClosed));
         Arc::new(Self {
             clock_epoch: Instant::now(),
-            close_timeout: Duration::from_secs(config.close_timeout.into()),
             track_activity: (config.auto_ping && config.ping_interval != 0)
                 || config.idle_timeout != 0,
             last_data_ms: AtomicU64::new(0),
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal_tx,
             reader_waker: std::sync::Mutex::new(None),
+            application_started: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         })
@@ -1117,6 +1121,7 @@ pub struct SplitReader<S> {
 /// owned transport before reporting the timeout. A partial frame is never
 /// followed by a Close frame; pending peer Ping replies may be coalesced.
 pub struct SplitWriter<S> {
+    control_tx: mpsc::Sender<ControlRequest>,
     application_tx: mpsc::Sender<ApplicationRequest>,
     shared: Arc<SplitShared>,
     _stream: PhantomData<fn() -> S>,
@@ -1173,12 +1178,13 @@ where
                 pending_messages: self.pending_messages,
                 pending_index: self.pending_index,
                 pending_terminal_error: self.pending_terminal_error,
-                control_tx,
+                control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
                 terminal_reported: false,
             },
             SplitWriter {
+                control_tx,
                 application_tx,
                 shared,
                 _stream: PhantomData,
@@ -1372,8 +1378,8 @@ impl<S> Drop for SplitReader<S> {
     }
 }
 
-/// A cancelled accepted request may have written a frame prefix or advanced
-/// compression state. Close before another application request can be accepted.
+/// A queued request is cancellation-safe until the driver publishes that it
+/// has crossed the encoder boundary. After that point the connection must stop.
 struct SplitSendGuard<'a> {
     shared: &'a SplitShared,
     completed: bool,
@@ -1381,7 +1387,7 @@ struct SplitSendGuard<'a> {
 
 impl Drop for SplitSendGuard<'_> {
     fn drop(&mut self) {
-        if !self.completed {
+        if !self.completed && self.shared.application_started.load(Ordering::Acquire) {
             self.shared.begin_closing();
             self.shared.cancel_connection();
         }
@@ -1391,39 +1397,49 @@ impl Drop for SplitSendGuard<'_> {
 impl<S> SplitWriter<S> {
     /// Send a message through the connection-scoped writer driver.
     ///
-    /// Cancelling after queue acceptance closes the connection; the driver may
-    /// already have advanced compression state or written a frame prefix.
-    /// Zero transport progress does not make cancellation recoverable. Retain
-    /// the send future across `select!` if the connection must remain usable.
+    /// Cancelling before the driver starts the request drops that request and
+    /// keeps the connection usable. Once encoding or transport writing starts,
+    /// cancellation closes the connection unless the frame has fully flushed.
+    /// An accepted Close request continues independently of its caller.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         let is_close = msg.is_close();
-        let close_timeout = self.shared.close_timeout;
-        let send = async {
-            if !self.shared.is_open() {
+        if !self.shared.is_open() {
+            return Err(self.current_error());
+        }
+        if is_close {
+            let control = self
+                .control_tx
+                .reserve()
+                .await
+                .map_err(|_| self.current_error())?;
+            let application = self
+                .application_tx
+                .reserve()
+                .await
+                .map_err(|_| self.current_error())?;
+            if !self.shared.begin_closing() {
                 return Err(self.current_error());
             }
             let (tx, rx) = oneshot::channel();
-            self.application_tx
-                .send(ApplicationRequest::Send(msg, tx))
-                .await
-                .map_err(|_| self.current_error())?;
-            let mut guard = SplitSendGuard {
-                shared: &self.shared,
-                completed: false,
-            };
-            let result = rx.await.map_err(|_| self.current_error());
-            guard.completed = true;
-            result?
-        };
-        if is_close {
-            // Include time queued behind a blocked control write. Dropping an
-            // accepted send triggers SplitSendGuard and releases the transport.
-            tokio::time::timeout(close_timeout, send)
-                .await
-                .unwrap_or(Err(Error::ConnectionClosed))
-        } else {
-            send.await
+            application.send(ApplicationRequest::Send(msg, tx));
+            control.send(ControlRequest::LocalCloseStarted(
+                tokio::time::Instant::now(),
+            ));
+            return rx.await.map_err(|_| self.current_error())?;
         }
+
+        let (tx, rx) = oneshot::channel();
+        self.application_tx
+            .send(ApplicationRequest::Send(msg, tx))
+            .await
+            .map_err(|_| self.current_error())?;
+        let mut guard = SplitSendGuard {
+            shared: &self.shared,
+            completed: false,
+        };
+        let result = rx.await.map_err(|_| self.current_error());
+        guard.completed = true;
+        result?
     }
 
     /// Send a text message.
@@ -1499,6 +1515,7 @@ async fn split_writer_driver<S, E>(
     let mut closing = SplitClosing {
         deadline: None,
         timeout: Duration::from_secs(config.close_timeout.into()),
+        local_close_pending: false,
     };
     let mut local_close_sent = false;
     let mut deferred_control = None;
@@ -1570,6 +1587,10 @@ async fn split_writer_driver<S, E>(
                             received_at.saturating_duration_since(epoch).as_millis() as u64;
                         heartbeat.on_inbound(received_ms, Some(&payload));
                     }
+                    ControlRequest::LocalCloseStarted(started) => {
+                        heartbeat.stop();
+                        closing.begin_local(started);
+                    }
                     ControlRequest::PeerClose => {
                         heartbeat.stop();
                         let deadline = closing.begin();
@@ -1606,7 +1627,7 @@ async fn split_writer_driver<S, E>(
                         .as_pin_mut()
                         .map_or(Poll::Pending, |sleep| sleep.poll(cx))
                 }
-            }), if closing.deadline.is_some() => {
+            }), if closing.deadline.is_some() && !closing.local_close_pending => {
                 terminate(TerminalCause::ConnectionClosed);
                 break;
             }
@@ -1628,7 +1649,7 @@ async fn split_writer_driver<S, E>(
                     .get_or_insert_with(|| HeartbeatTimer::new(target))
                     .poll(target, cx)
                     .map(|()| SplitDriverWake::Heartbeat)
-            }), if shared.is_open() => {
+            }), if shared.is_open() || closing.local_close_pending => {
                 let request = match wake {
                     SplitDriverWake::Application(request) => request,
                     SplitDriverWake::Heartbeat => {
@@ -1692,22 +1713,34 @@ async fn split_writer_driver<S, E>(
                     break;
                 };
                 match request {
-                    ApplicationRequest::Send(message, completion) => {
-                        if !shared.is_open() {
+                    ApplicationRequest::Send(message, mut completion) => {
+                        let is_close = message.is_close();
+                        if completion.is_closed() && !is_close {
+                            continue;
+                        }
+                        if !shared.is_open() && !(is_close && closing.local_close_pending) {
                             let _ = completion.send(Err(Error::ConnectionClosed));
                             continue;
                         }
-                        let is_close = message.is_close();
                         if is_close {
-                            shared.begin_closing();
+                            closing.local_close_pending = false;
                             heartbeat.stop();
                             local_close_sent = true;
                             closing.begin();
+                        } else {
+                            shared.application_started.store(true, Ordering::Release);
+                            if completion.is_closed() {
+                                shared.application_started.store(false, Ordering::Release);
+                                continue;
+                            }
                         }
                         write_buf.clear();
                         let result = match encoder.encode_message(&message, &mut write_buf) {
                             Ok(()) if write_buf.len() > config.max_backpressure => Err(Error::BufferFull),
-                            Ok(()) => {
+                            Ok(()) if !is_close && completion.is_closed() => {
+                                Err(Error::ConnectionClosed)
+                            }
+                            Ok(()) if is_close => {
                                 await_split_write(
                                     write_split_bytes(&mut writer, &write_buf),
                                     &mut heartbeat,
@@ -1718,8 +1751,24 @@ async fn split_writer_driver<S, E>(
                                     &mut closing,
                                 ).await
                             }
+                            Ok(()) => tokio::select! {
+                                biased;
+                                result = await_split_write(
+                                    write_split_bytes(&mut writer, &write_buf),
+                                    &mut heartbeat,
+                                    &mut control_rx,
+                                    &mut deferred_control,
+                                    &shared,
+                                    &terminate,
+                                    &mut closing,
+                                ) => result,
+                                _ = completion.closed() => Err(Error::ConnectionClosed),
+                            },
                             Err(error) => Err(error),
                         };
+                        if !is_close {
+                            shared.application_started.store(false, Ordering::Release);
+                        }
                         let failed = result.is_err();
                         let _ = completion.send(result);
                         if failed {
@@ -1727,16 +1776,29 @@ async fn split_writer_driver<S, E>(
                             break;
                         }
                     }
-                    ApplicationRequest::Flush(completion) => {
-                        let result = await_split_write(
-                            async { writer.flush().await.map_err(Into::into) },
-                            &mut heartbeat,
-                            &mut control_rx,
-                            &mut deferred_control,
-                            &shared,
-                            &terminate,
-                            &mut closing,
-                        ).await;
+                    ApplicationRequest::Flush(mut completion) => {
+                        if completion.is_closed() {
+                            continue;
+                        }
+                        shared.application_started.store(true, Ordering::Release);
+                        if completion.is_closed() {
+                            shared.application_started.store(false, Ordering::Release);
+                            continue;
+                        }
+                        let result = tokio::select! {
+                            biased;
+                            result = await_split_write(
+                                async { writer.flush().await.map_err(Into::into) },
+                                &mut heartbeat,
+                                &mut control_rx,
+                                &mut deferred_control,
+                                &shared,
+                                &terminate,
+                                &mut closing,
+                            ) => result,
+                            _ = completion.closed() => Err(Error::ConnectionClosed),
+                        };
+                        shared.application_started.store(false, Ordering::Release);
                         let failed = result.is_err();
                         let _ = completion.send(result);
                         if failed {
@@ -1754,6 +1816,9 @@ async fn split_writer_driver<S, E>(
 struct SplitClosing {
     deadline: Option<tokio::time::Instant>,
     timeout: Duration,
+    // A queued local Close gets one immediate write attempt before a zero
+    // deadline can win the driver's main select.
+    local_close_pending: bool,
 }
 
 impl SplitClosing {
@@ -1761,6 +1826,11 @@ impl SplitClosing {
         *self
             .deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + self.timeout)
+    }
+
+    fn begin_local(&mut self, started: tokio::time::Instant) {
+        self.deadline.get_or_insert(started + self.timeout);
+        self.local_close_pending = true;
     }
 }
 
@@ -1775,13 +1845,6 @@ async fn await_split_write(
     terminate: impl Fn(TerminalCause),
     closing: &mut SplitClosing,
 ) -> Result<()> {
-    if closing
-        .deadline
-        .is_some_and(|at| tokio::time::Instant::now() >= at)
-    {
-        terminate(TerminalCause::ConnectionClosed);
-        return Err(Error::ConnectionClosed);
-    }
     tokio::pin!(write);
     let immediate = std::future::poll_fn(|cx| {
         Poll::Ready(match write.as_mut().poll(cx) {
@@ -1852,6 +1915,10 @@ async fn await_split_write(
                         heartbeat.stop();
                         closing.begin();
                         *deferred_control = Some(ControlRequest::PeerClose);
+                    }
+                    Some(ControlRequest::LocalCloseStarted(started)) => {
+                        heartbeat.stop();
+                        closing.begin_local(started);
                     }
                     Some(ControlRequest::Eof) | None => return Err(Error::ConnectionClosed),
                 }
@@ -2663,6 +2730,7 @@ pub struct CompressedSplitReader<S> {
 /// Blocked-write timeouts and transport release follow [`SplitWriter`].
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedSplitWriter<S> {
+    control_tx: mpsc::Sender<ControlRequest>,
     application_tx: mpsc::Sender<ApplicationRequest>,
     shared: Arc<SplitShared>,
     _stream: PhantomData<fn() -> S>,
@@ -2758,12 +2826,13 @@ where
                 pending_messages: self.pending_messages,
                 pending_index: self.pending_index,
                 pending_terminal_error: self.pending_terminal_error,
-                control_tx,
+                control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
                 terminal_reported: false,
             },
             CompressedSplitWriter {
+                control_tx,
                 application_tx,
                 shared,
                 _stream: PhantomData,
@@ -2961,39 +3030,49 @@ impl<S> Drop for CompressedSplitReader<S> {
 impl<S> CompressedSplitWriter<S> {
     /// Send a message through the connection-scoped writer driver.
     ///
-    /// Cancelling after queue acceptance closes the connection; the driver may
-    /// already have advanced compression state or written a frame prefix.
-    /// Zero transport progress does not make cancellation recoverable. Retain
-    /// the send future across `select!` if the connection must remain usable.
+    /// Cancelling before the driver starts the request drops that request and
+    /// keeps the connection usable. Once encoding or transport writing starts,
+    /// cancellation closes the connection unless the frame has fully flushed.
+    /// An accepted Close request continues independently of its caller.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         let is_close = msg.is_close();
-        let close_timeout = self.shared.close_timeout;
-        let send = async {
-            if !self.shared.is_open() {
+        if !self.shared.is_open() {
+            return Err(self.current_error());
+        }
+        if is_close {
+            let control = self
+                .control_tx
+                .reserve()
+                .await
+                .map_err(|_| self.current_error())?;
+            let application = self
+                .application_tx
+                .reserve()
+                .await
+                .map_err(|_| self.current_error())?;
+            if !self.shared.begin_closing() {
                 return Err(self.current_error());
             }
             let (tx, rx) = oneshot::channel();
-            self.application_tx
-                .send(ApplicationRequest::Send(msg, tx))
-                .await
-                .map_err(|_| self.current_error())?;
-            let mut guard = SplitSendGuard {
-                shared: &self.shared,
-                completed: false,
-            };
-            let result = rx.await.map_err(|_| self.current_error());
-            guard.completed = true;
-            result?
-        };
-        if is_close {
-            // Include time queued behind a blocked control write. Dropping an
-            // accepted send triggers SplitSendGuard and releases the transport.
-            tokio::time::timeout(close_timeout, send)
-                .await
-                .unwrap_or(Err(Error::ConnectionClosed))
-        } else {
-            send.await
+            application.send(ApplicationRequest::Send(msg, tx));
+            control.send(ControlRequest::LocalCloseStarted(
+                tokio::time::Instant::now(),
+            ));
+            return rx.await.map_err(|_| self.current_error())?;
         }
+
+        let (tx, rx) = oneshot::channel();
+        self.application_tx
+            .send(ApplicationRequest::Send(msg, tx))
+            .await
+            .map_err(|_| self.current_error())?;
+        let mut guard = SplitSendGuard {
+            shared: &self.shared,
+            completed: false,
+        };
+        let result = rx.await.map_err(|_| self.current_error());
+        guard.completed = true;
+        result?
     }
 
     /// Send a text message
