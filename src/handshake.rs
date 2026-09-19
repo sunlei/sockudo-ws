@@ -23,6 +23,8 @@ const RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
     "sec-websocket-version",
     "sec-websocket-protocol",
     "sec-websocket-extensions",
+    "content-length",
+    "transfer-encoding",
 ];
 
 /// WebSocket handshake request (server-side)
@@ -98,6 +100,16 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
                     && has_token_ignore_case(value, "upgrade")
                 {
                     connection_upgrade = true;
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    if !is_zero_content_length(value) {
+                        return Err(Error::InvalidHttp(
+                            "WebSocket handshake must not contain a body",
+                        ));
+                    }
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    return Err(Error::InvalidHttp(
+                        "WebSocket handshake must not use Transfer-Encoding",
+                    ));
                 }
             }
 
@@ -142,6 +154,13 @@ fn has_token_ignore_case(value: &str, token: &str) -> bool {
     value
         .split(',')
         .any(|part| part.trim().eq_ignore_ascii_case(token))
+}
+
+fn is_zero_content_length(value: &str) -> bool {
+    value.split(',').all(|length| {
+        let length = length.trim_matches([' ', '\t']);
+        !length.is_empty() && length.bytes().all(|byte| byte == b'0')
+    })
 }
 
 /// Generate the Sec-WebSocket-Accept key
