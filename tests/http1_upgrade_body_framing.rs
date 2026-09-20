@@ -22,7 +22,9 @@ fn request_accepts_zero_content_length_values() {
     for header in [
         "Content-Length: 0\r\n",
         "Content-Length: 00\r\n",
+        "Content-Length:\t000\t\r\n",
         "Content-Length: 0, 0\r\n",
+        "Content-Length: 000,\t00 \r\n",
         "Content-Length: 0\r\nContent-Length: 0\r\n",
     ] {
         assert!(parse_request(&request_with(header)).unwrap().is_some());
