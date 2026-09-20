@@ -36,24 +36,6 @@ fn request_rejects_repeated_key_and_version_fields() {
 }
 
 #[test]
-fn request_combines_repeatable_protocol_and_extension_fields() {
-    let request = request_with(
-        "Sec-WebSocket-Protocol: chat\r\n\
-         Sec-WebSocket-Protocol: superchat\r\n\
-         Sec-WebSocket-Extensions: extension-one\r\n\
-         Sec-WebSocket-Extensions: extension-two; mode=fast\r\n",
-    );
-
-    let (request, _) = parse_request(&request).unwrap().unwrap();
-
-    assert_eq!(request.protocol.as_deref(), Some("chat, superchat"));
-    assert_eq!(
-        request.extensions.as_deref(),
-        Some("extension-one, extension-two; mode=fast")
-    );
-}
-
-#[test]
 fn response_rejects_repeated_singleton_websocket_fields() {
     for (header, message) in [
         (

@@ -239,11 +239,10 @@ where
 
         if let Some((req, consumed)) = parse_request(&buf)? {
             let path = req.path.to_string();
-            let protocol = req.protocol.as_deref().map(String::from);
-            let extensions = req.extensions.as_deref().map(String::from);
+            let protocol = req.protocol.map(String::from);
+            let extensions = req.extensions.map(String::from);
             let accept_key = generate_accept_key(req.key);
-            let response =
-                build_response(&accept_key, req.protocol.as_deref(), response_extensions);
+            let response = build_response(&accept_key, req.protocol, response_extensions);
 
             write_all_owned(stream, response).await?;
             stream.flush().await?;

@@ -6,8 +6,6 @@
 //! - Minimal allocations
 //! - Fast Base64/SHA-1 for accept key generation
 
-use std::borrow::Cow;
-
 use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
 use sha1::{Digest, Sha1};
@@ -38,12 +36,10 @@ pub struct HandshakeRequest<'a> {
     pub key: &'a str,
     /// The Sec-WebSocket-Version header
     pub version: &'a str,
-    /// The Sec-WebSocket-Protocol header (optional).
-    /// Repeated request fields are joined with `, `.
-    pub protocol: Option<Cow<'a, str>>,
-    /// The Sec-WebSocket-Extensions header (optional).
-    /// Repeated request fields are joined with `, `.
-    pub extensions: Option<Cow<'a, str>>,
+    /// The Sec-WebSocket-Protocol header (optional)
+    pub protocol: Option<&'a str>,
+    /// The Sec-WebSocket-Extensions header (optional)
+    pub extensions: Option<&'a str>,
     /// The Origin header (optional)
     pub origin: Option<&'a str>,
 }
@@ -91,9 +87,9 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
                         return Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Version"));
                     }
                 } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
-                    append_header_value(&mut protocol, value);
+                    protocol = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
-                    append_header_value(&mut extensions, value);
+                    extensions = Some(value);
                 } else if name.eq_ignore_ascii_case("host") {
                     host = Some(value);
                 } else if name.eq_ignore_ascii_case("origin") {
@@ -150,16 +146,6 @@ fn has_token_ignore_case(value: &str, token: &str) -> bool {
     value
         .split(',')
         .any(|part| part.trim().eq_ignore_ascii_case(token))
-}
-
-fn append_header_value<'a>(current: &mut Option<Cow<'a, str>>, value: &'a str) {
-    match current {
-        Some(current) => {
-            current.to_mut().push_str(", ");
-            current.to_mut().push_str(value);
-        }
-        None => *current = Some(Cow::Borrowed(value)),
-    }
 }
 
 /// Generate the Sec-WebSocket-Accept key
@@ -461,14 +447,14 @@ where
         if let Some((req, consumed)) = parse_request(&buf)? {
             // Extract values before mutably borrowing buf
             let path = req.path.to_string();
-            let protocol = req.protocol.as_deref().map(String::from);
-            let extensions = req.extensions.as_deref().map(String::from);
+            let protocol = req.protocol.map(String::from);
+            let extensions = req.extensions.map(String::from);
 
             // Generate accept key
             let accept_key = generate_accept_key(req.key);
 
             // Build and send response
-            let response = build_response(&accept_key, req.protocol.as_deref(), None);
+            let response = build_response(&accept_key, req.protocol, None);
             stream.write_all(&response).await?;
             stream.flush().await?;
 
