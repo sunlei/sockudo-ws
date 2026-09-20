@@ -46,6 +46,13 @@ pub struct HandshakeRequest<'a> {
     pub origin: Option<&'a str>,
 }
 
+fn is_zero_content_length(value: &str) -> bool {
+    value.split(',').all(|length| {
+        let length = length.trim_matches([' ', '\t']);
+        !length.is_empty() && length.bytes().all(|byte| byte == b'0')
+    })
+}
+
 /// Parse a WebSocket upgrade request
 ///
 /// Returns the parsed request and the number of bytes consumed.
@@ -154,13 +161,6 @@ fn has_token_ignore_case(value: &str, token: &str) -> bool {
     value
         .split(',')
         .any(|part| part.trim().eq_ignore_ascii_case(token))
-}
-
-fn is_zero_content_length(value: &str) -> bool {
-    value.split(',').all(|length| {
-        let length = length.trim_matches([' ', '\t']);
-        !length.is_empty() && length.bytes().all(|byte| byte == b'0')
-    })
 }
 
 /// Generate the Sec-WebSocket-Accept key
