@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
@@ -449,4 +449,56 @@ async fn zero_close_timeout_cancels_a_partial_close() {
         .unwrap();
     assert!(matches!(result, Err(Error::ConnectionClosed)));
     assert_eq!(state.bytes.borrow().len(), 3);
+}
+
+#[compio::test]
+async fn cancelling_an_enqueued_send_completes_it_without_closing() {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+    let (_reader, mut writer) =
+        CompioWebSocketStream::client(RecordingIo(bytes.clone()), config).split();
+
+    {
+        let send = writer.send_text("first");
+        futures_util::pin_mut!(send);
+        assert!(
+            poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+    }
+    writer.send_text("second").await.unwrap();
+
+    let mut wire = bytes::BytesMut::from(bytes.borrow().as_slice());
+    let messages = Protocol::new(Role::Server, 65_536, 65_536)
+        .process(&mut wire)
+        .unwrap();
+    assert!(
+        matches!(messages.as_slice(), [Message::Text(first), Message::Text(second)] if first == "first" && second == "second")
+    );
+    assert!(!writer.is_closed());
+}
+
+#[compio::test]
+async fn cancelling_an_enqueued_close_keeps_the_connection_closing() {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+    let (_reader, mut writer) =
+        CompioWebSocketStream::client(RecordingIo(bytes.clone()), config).split();
+
+    {
+        let close = writer.close(1000, "");
+        futures_util::pin_mut!(close);
+        assert!(
+            poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+    }
+
+    assert!(matches!(
+        writer.send_text("later").await,
+        Err(Error::ConnectionClosed)
+    ));
+    assert_eq!(bytes.borrow().first(), Some(&0x88));
 }
