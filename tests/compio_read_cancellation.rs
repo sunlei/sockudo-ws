@@ -154,7 +154,9 @@ macro_rules! recovery_timeout_case {
             let result = compio::time::timeout(Duration::from_millis(2500), ws.next()).await;
             assert!(matches!(result, Ok(Some(Err(Error::HeartbeatTimeout)))));
             // The recovery budget begins at Ping's due time, not when read started.
-            assert!(started.elapsed() >= Duration::from_secs(2));
+            // Allow timer rounding at the exact two-second boundary while still
+            // rejecting the incorrect one-second deadline from read start.
+            assert!(started.elapsed() >= Duration::from_millis(1900));
             assert!(ws.next().await.is_none());
         }
     };
