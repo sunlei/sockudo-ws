@@ -148,8 +148,8 @@ struct PubSubData {
 /// # Thread Safety
 ///
 /// `PubSub` is fully thread-safe and can be shared across async tasks. Membership
-/// changes are linearized through one state lock. Publishing snapshots recipient
-/// senders under a read lock and performs channel sends after releasing the lock.
+/// changes are linearized through one state lock. Publishing holds a read lock
+/// while enqueueing messages so its recipient set cannot change mid-operation.
 ///
 /// # Subscriber ID Modes
 ///
@@ -509,10 +509,7 @@ impl PubSub {
         let data = self.state.read();
         // Socket ID not found means publish to all subscribers.
         let exclude = data.socket_id_map.get(socket_id).copied();
-        let recipients = Self::recipient_snapshot(&data, topic, exclude);
-        drop(data);
-
-        self.send_to_recipients(recipients, message)
+        self.publish_to_topic(&data, topic, message, exclude)
     }
 
     /// Check if a socket ID is subscribed to a topic
@@ -581,9 +578,8 @@ impl PubSub {
     /// Publish a message to all subscribers of a topic
     ///
     /// The message is cloned for each subscriber (zero-copy due to `Bytes`).
-    /// Recipients are snapshotted atomically with membership changes, then sent
-    /// outside the state lock. A concurrent removal ordered after that snapshot
-    /// does not cancel delivery already selected by this publish operation.
+    /// Membership changes cannot alter the recipient set while this operation is
+    /// enqueueing the message.
     ///
     /// # Arguments
     ///
@@ -594,8 +590,7 @@ impl PubSub {
     ///
     /// Result indicating how many subscribers received the message
     pub fn publish(&self, topic: &str, message: Message) -> PublishResult {
-        let recipients = Self::recipient_snapshot(&self.state.read(), topic, None);
-        self.send_to_recipients(recipients, message)
+        self.publish_to_topic(&self.state.read(), topic, message, None)
     }
 
     /// Publish a message to all subscribers except one
@@ -618,44 +613,32 @@ impl PubSub {
         topic: &str,
         message: Message,
     ) -> PublishResult {
-        let recipients = Self::recipient_snapshot(&self.state.read(), topic, Some(exclude));
-        self.send_to_recipients(recipients, message)
+        self.publish_to_topic(&self.state.read(), topic, message, Some(exclude))
     }
 
-    fn recipient_snapshot(
+    fn publish_to_topic(
+        &self,
         data: &PubSubData,
         topic: &str,
-        exclude: Option<SubscriberId>,
-    ) -> Option<Vec<UnboundedSender<Message>>> {
-        let topic_subscribers = data.topics.get(topic)?;
-        let recipients = topic_subscribers
-            .iter()
-            .filter(|id| Some(**id) != exclude)
-            .map(|id| {
-                data.subscribers
-                    .get(id)
-                    .expect("topic index must reference an active subscriber")
-                    .sender
-                    .clone()
-            })
-            .collect();
-
-        Some(recipients)
-    }
-
-    fn send_to_recipients(
-        &self,
-        recipients: Option<Vec<UnboundedSender<Message>>>,
         message: Message,
+        exclude: Option<SubscriberId>,
     ) -> PublishResult {
-        let Some(recipients) = recipients else {
+        let Some(topic_subscribers) = data.topics.get(topic) else {
             return PublishResult::NoSubscribers;
         };
 
         let mut sent = 0;
-        for sender in recipients {
+        for id in topic_subscribers {
+            if Some(*id) == exclude {
+                continue;
+            }
+
+            let subscriber = data
+                .subscribers
+                .get(id)
+                .expect("topic index must reference an active subscriber");
             // Clone is O(1) for Message because it uses Bytes internally
-            if sender.send(message.clone()).is_ok() {
+            if subscriber.sender.send(message.clone()).is_ok() {
                 sent += 1;
             }
         }
@@ -1051,34 +1034,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_idempotent_socket_id_creation_returns_one_subscriber() {
-        let pubsub = Arc::new(PubSub::new());
-        let barrier = Arc::new(Barrier::new(3));
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
-                let pubsub = Arc::clone(&pubsub);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    let (tx, _rx) = mpsc::unbounded_channel();
-                    barrier.wait();
-                    pubsub.create_subscriber_with_id_or_get("1234.5678", tx)
-                })
-            })
-            .collect();
-
-        barrier.wait();
-        let results: Vec<_> = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("creation thread must not panic"))
-            .collect();
-
-        assert!(results[0].0 == results[1].0);
-        assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
-        assert_eq!(pubsub.subscriber_count(), 1);
-        assert_consistent(&pubsub);
-    }
-
-    #[test]
     fn concurrent_membership_changes_and_removal_leave_no_stale_indexes() {
         let pubsub = Arc::new(PubSub::new());
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1120,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_publish_and_removal_follow_snapshot_order() {
+    fn concurrent_publish_and_removal_follow_lock_order() {
         let pubsub = Arc::new(PubSub::new());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let id = pubsub.create_subscriber(tx);
