@@ -5,7 +5,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use sockudo_ws::compio::{CompioHttp3Server, connect_http3};
+use sockudo_ws::compio::{CompioHttp3Server, connect_http3_multiplexed};
 use sockudo_ws::{Config, Error, Message};
 
 static INSTALL_CRYPTO: Once = Once::new();
@@ -54,26 +54,31 @@ async fn cancelled_client_write_makes_the_http3_stream_terminal() {
 
     let server_task = compio::runtime::spawn(async move {
         server
-            .serve(move |mut ws, _| {
+            .serve(move |mut ws, request| {
                 let mut observed_tx = observed_tx.clone();
                 async move {
-                    compio::time::sleep(Duration::from_millis(100)).await;
-                    let observed = compio::time::timeout(Duration::from_secs(5), ws.next()).await;
-                    observed_tx
-                        .send(matches!(observed, Ok(Some(Err(_)))))
-                        .await
-                        .unwrap();
+                    if request.path == "/cancelled-write" {
+                        compio::time::sleep(Duration::from_millis(100)).await;
+                        let observed =
+                            compio::time::timeout(Duration::from_secs(5), ws.next()).await;
+                        observed_tx
+                            .send(matches!(observed, Ok(Some(Err(_)))))
+                            .await
+                            .unwrap();
+                    } else {
+                        assert_eq!(request.path, "/replacement");
+                        let message = ws.next().await.unwrap().unwrap();
+                        ws.send(message).await.unwrap();
+                    }
                 }
             })
             .await
             .unwrap();
     });
 
-    let mut client = connect_http3(
+    let mut connection = connect_http3_multiplexed(
         addr,
         "localhost",
-        "/cancelled-write",
-        None,
         client_tls,
         Config::builder()
             .max_backpressure(PAYLOAD_SIZE + 14)
@@ -81,6 +86,10 @@ async fn cancelled_client_write_makes_the_http3_stream_terminal() {
     )
     .await
     .unwrap();
+    let mut client = connection
+        .open_websocket("/cancelled-write", None)
+        .await
+        .unwrap();
 
     let cancelled = compio::time::timeout(
         Duration::from_millis(10),
@@ -105,6 +114,15 @@ async fn cancelled_client_write_makes_the_http3_stream_terminal() {
             .expect("server stopped before reporting the reset")
     );
 
+    let mut replacement = connection
+        .open_websocket("/replacement", None)
+        .await
+        .expect("cancelled stream closed the HTTP/3 connection");
+    replacement.send_text("still-open").await.unwrap();
+    let echoed = replacement.next().await.unwrap().unwrap();
+    assert!(matches!(echoed, Message::Text(text) if text == "still-open"));
+
+    connection.close();
     endpoint.close(compio::quic::VarInt::from_u32(0x100), b"done");
     server_task.await.unwrap();
 }
@@ -130,39 +148,43 @@ async fn cancelled_server_write_makes_the_http3_stream_terminal() {
 
     let server_task = compio::runtime::spawn(async move {
         server
-            .serve(move |mut ws, _| {
+            .serve(move |mut ws, request| {
                 let mut terminal_tx = terminal_tx.clone();
                 async move {
-                    let cancelled = compio::time::timeout(
-                        Duration::from_millis(10),
-                        ws.send(Message::binary(vec![0xa5; PAYLOAD_SIZE])),
-                    )
-                    .await;
-                    assert!(
-                        cancelled.is_err(),
-                        "large write completed before cancellation"
-                    );
-                    let error = ws
-                        .send_text("must-not-send")
-                        .await
-                        .expect_err("cancelled HTTP/3 stream accepted another write");
-                    terminal_tx.send(is_cancelled_write(&error)).await.unwrap();
+                    if request.path == "/cancelled-server-write" {
+                        let cancelled = compio::time::timeout(
+                            Duration::from_millis(10),
+                            ws.send(Message::binary(vec![0xa5; PAYLOAD_SIZE])),
+                        )
+                        .await;
+                        assert!(
+                            cancelled.is_err(),
+                            "large write completed before cancellation"
+                        );
+                        let error = ws
+                            .send_text("must-not-send")
+                            .await
+                            .expect_err("cancelled HTTP/3 stream accepted another write");
+                        terminal_tx.send(is_cancelled_write(&error)).await.unwrap();
+                    } else {
+                        assert_eq!(request.path, "/replacement");
+                        let message = ws.next().await.unwrap().unwrap();
+                        ws.send(message).await.unwrap();
+                    }
                 }
             })
             .await
             .unwrap();
     });
 
-    let mut client = connect_http3(
-        addr,
-        "localhost",
-        "/cancelled-server-write",
-        None,
-        client_tls,
-        Config::default(),
-    )
-    .await
-    .unwrap();
+    let mut connection =
+        connect_http3_multiplexed(addr, "localhost", client_tls, Config::default())
+            .await
+            .unwrap();
+    let mut client = connection
+        .open_websocket("/cancelled-server-write", None)
+        .await
+        .unwrap();
     compio::time::sleep(Duration::from_millis(100)).await;
 
     let observed = compio::time::timeout(Duration::from_secs(5), client.next())
@@ -176,6 +198,15 @@ async fn cancelled_server_write_makes_the_http3_stream_terminal() {
             .expect("server stopped before reporting terminal state")
     );
 
+    let mut replacement = connection
+        .open_websocket("/replacement", None)
+        .await
+        .expect("cancelled stream closed the HTTP/3 connection");
+    replacement.send_text("still-open").await.unwrap();
+    let echoed = replacement.next().await.unwrap().unwrap();
+    assert!(matches!(echoed, Message::Text(text) if text == "still-open"));
+
+    connection.close();
     endpoint.close(compio::quic::VarInt::from_u32(0x100), b"done");
     server_task.await.unwrap();
 }
