@@ -1,10 +1,44 @@
 #![cfg(feature = "tokio-runtime")]
 
-use std::task::Poll;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt, poll};
 use sockudo_ws::{Config, Error, Message, WebSocketStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+struct FailingWrite;
+
+impl AsyncRead for FailingWrite {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for FailingWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::other("test write failure")))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 async fn check_flush<S>(mut ws: S, mut peer: DuplexStream, send: bool)
 where
@@ -136,3 +170,33 @@ high_water_case!(compressed_feed_drains_at_the_high_water_mark, |io| {
         },
     )
 });
+
+async fn check_high_water_write_error<S>(mut ws: S)
+where
+    S: Sink<Message, Error = Error> + Unpin,
+{
+    ws.feed(Message::binary(vec![1; 65532])).await.unwrap();
+    let error = ws.feed(Message::binary(vec![2])).await.unwrap_err();
+    assert!(matches!(error, Error::Io(error) if error.kind() == io::ErrorKind::Other));
+}
+
+#[tokio::test]
+async fn high_water_readiness_propagates_write_errors() {
+    check_high_water_write_error(WebSocketStream::server(FailingWrite, Config::default())).await;
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[tokio::test]
+async fn compressed_high_water_readiness_propagates_write_errors() {
+    use sockudo_ws::{CompressedWebSocketStream, DeflateConfig};
+
+    check_high_water_write_error(CompressedWebSocketStream::server(
+        FailingWrite,
+        Config::default(),
+        DeflateConfig {
+            compression_threshold: usize::MAX,
+            ..Default::default()
+        },
+    ))
+    .await;
+}
