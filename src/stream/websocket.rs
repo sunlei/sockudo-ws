@@ -69,6 +69,8 @@ pin_project! {
         inner: S,
         protocol: Protocol,
         read_buf: BytesMut,
+        // Reclaim once after buffered input reaches half a receive window.
+        reclaim_read_window: bool,
         // Leftover handshake bytes must be processed once before the first read.
         has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
@@ -145,6 +147,7 @@ where
             inner,
             protocol,
             read_buf,
+            reclaim_read_window: false,
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
@@ -358,6 +361,12 @@ where
         let this = self.project();
 
         // Ensure we have space in the buffer
+        // Reuse an empty receive window when no delivered payload still owns it.
+        if *this.reclaim_read_window && this.read_buf.is_empty() {
+            *this.reclaim_read_window = false;
+            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+        }
+
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
             this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
@@ -372,6 +381,10 @@ where
                 // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
+                }
+                // Keep the hint across partial frames until the receive window is empty.
+                if this.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
+                    *this.reclaim_read_window = true;
                 }
                 if n == 0 {
                     Poll::Ready(Ok(0))
@@ -1428,6 +1441,8 @@ pub struct SplitReader<S> {
     reader: SplitTransport<S>,
     protocol: Protocol,
     read_buf: BytesMut,
+    // Reclaim once after buffered input reaches half a receive window.
+    reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
     pending_messages: Vec<Message>,
     // Deliver successfully parsed messages before a later parse failure.
@@ -1496,6 +1511,7 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
+                reclaim_read_window: self.reclaim_read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
                 pending_parse_error: self.pending_parse_error,
@@ -1597,6 +1613,12 @@ where
                 }
             }
 
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.reclaim_read_window && self.read_buf.is_empty() {
+                self.reclaim_read_window = false;
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+            }
+
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
                 self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
@@ -1615,20 +1637,25 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => match self
-                            .protocol
-                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
-                        {
-                            Ok(()) => {
-                                if accepted_fragment {
-                                    self.shared.note_inbound();
+                        Ok(_) => {
+                            if self.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
+                                self.reclaim_read_window = true;
+                            }
+                            match self
+                                .protocol
+                                .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
+                            {
+                                Ok(()) => {
+                                    if accepted_fragment {
+                                        self.shared.note_inbound();
+                                    }
+                                    self.pending_messages.reverse();
+                                },
+                                Err(error) => {
+                                    self.pending_messages.reverse();
+                                    self.pending_parse_error = Some(error);
+                                    self.shared.begin_read_error();
                                 }
-                                self.pending_messages.reverse();
-                            },
-                            Err(error) => {
-                                self.pending_messages.reverse();
-                                self.pending_parse_error = Some(error);
-                                self.shared.begin_read_error();
                             }
                         },
                         Err(error) => {
@@ -2132,6 +2159,8 @@ pin_project! {
         inner: S,
         protocol: crate::protocol::CompressedProtocol,
         read_buf: BytesMut,
+        // Reclaim once after buffered input reaches half a receive window.
+        reclaim_read_window: bool,
         // Leftover handshake bytes must be processed once before the first read.
         has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
@@ -2196,6 +2225,7 @@ where
             inner,
             protocol,
             read_buf,
+            reclaim_read_window: false,
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
@@ -2251,6 +2281,7 @@ where
             inner,
             protocol,
             read_buf,
+            reclaim_read_window: false,
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
@@ -2370,6 +2401,12 @@ where
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
 
+        // Reuse an empty receive window when no delivered payload still owns it.
+        if *this.reclaim_read_window && this.read_buf.is_empty() {
+            *this.reclaim_read_window = false;
+            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+        }
+
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
             this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
@@ -2383,6 +2420,10 @@ where
                 // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
+                }
+                // Keep the hint across partial frames until the receive window is empty.
+                if this.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
+                    *this.reclaim_read_window = true;
                 }
                 if n == 0 {
                     Poll::Ready(Ok(0))
@@ -2961,6 +3002,8 @@ pub struct CompressedSplitReader<S> {
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
     read_buf: BytesMut,
+    // Reclaim once after buffered input reaches half a receive window.
+    reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
     /// Pending messages from last decode
     pending_messages: Vec<Message>,
@@ -3075,6 +3118,7 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
+                reclaim_read_window: self.reclaim_read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
                 pending_parse_error: self.pending_parse_error,
@@ -3177,6 +3221,12 @@ where
                 }
             }
 
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.reclaim_read_window && self.read_buf.is_empty() {
+                self.reclaim_read_window = false;
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+            }
+
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
                 self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
@@ -3195,20 +3245,25 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => match self
-                            .protocol
-                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
-                        {
-                            Ok(()) => {
-                                if accepted_fragment {
-                                    self.shared.note_inbound();
+                        Ok(_) => {
+                            if self.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
+                                self.reclaim_read_window = true;
+                            }
+                            match self
+                                .protocol
+                                .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
+                            {
+                                Ok(()) => {
+                                    if accepted_fragment {
+                                        self.shared.note_inbound();
+                                    }
+                                    self.pending_messages.reverse();
+                                },
+                                Err(error) => {
+                                    self.pending_messages.reverse();
+                                    self.pending_parse_error = Some(error);
+                                    self.shared.begin_read_error();
                                 }
-                                self.pending_messages.reverse();
-                            },
-                            Err(error) => {
-                                self.pending_messages.reverse();
-                                self.pending_parse_error = Some(error);
-                                self.shared.begin_read_error();
                             }
                         },
                         Err(error) => {
