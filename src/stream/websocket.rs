@@ -69,7 +69,7 @@ pin_project! {
         inner: S,
         protocol: Protocol,
         read_buf: BytesMut,
-        // Reclaim once after a large read, not after every small message.
+        // Reclaim once after buffered input reaches half a receive window.
         reclaim_read_window: bool,
         // Leftover handshake bytes must be processed once before the first read.
         has_unprocessed_read_data: bool,
@@ -1441,7 +1441,7 @@ pub struct SplitReader<S> {
     reader: SplitTransport<S>,
     protocol: Protocol,
     read_buf: BytesMut,
-    // Reclaim once after a large read, not after every small message.
+    // Reclaim once after buffered input reaches half a receive window.
     reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
     pending_messages: Vec<Message>,
@@ -2159,7 +2159,7 @@ pin_project! {
         inner: S,
         protocol: crate::protocol::CompressedProtocol,
         read_buf: BytesMut,
-        // Reclaim once after a large read, not after every small message.
+        // Reclaim once after buffered input reaches half a receive window.
         reclaim_read_window: bool,
         // Leftover handshake bytes must be processed once before the first read.
         has_unprocessed_read_data: bool,
@@ -3002,7 +3002,7 @@ pub struct CompressedSplitReader<S> {
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
     read_buf: BytesMut,
-    // Reclaim once after a large read, not after every small message.
+    // Reclaim once after buffered input reaches half a receive window.
     reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
     /// Pending messages from last decode

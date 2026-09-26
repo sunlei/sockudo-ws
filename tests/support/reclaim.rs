@@ -6,7 +6,7 @@ use sockudo_ws::{Config, Message, WebSocketStream};
 use std::{
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -17,6 +17,7 @@ pub struct Input {
     pub pending: bool,
     pub inject_pending: bool,
     pub max_read: usize,
+    pub read_starts: Option<Arc<Mutex<Vec<usize>>>>,
 }
 
 impl AsyncRead for Input {
@@ -29,6 +30,10 @@ impl AsyncRead for Input {
             self.pending = false;
             cx.waker().wake_by_ref();
             return Poll::Pending;
+        }
+        if let Some(starts) = &self.read_starts {
+            // ReadBuf starts empty, so this points at the offered spare window.
+            starts.lock().unwrap().push(buf.filled().as_ptr() as usize);
         }
         let end = (self.offset + buf.remaining().min(self.max_read)).min(self.wire.len());
         buf.put_slice(&self.wire[self.offset..end]);
