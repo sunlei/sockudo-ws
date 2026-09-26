@@ -25,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 ///
 /// // After HTTP/2 handshake and Extended CONNECT negotiation
 /// let stream = Http2Stream::new(send_stream, recv_stream);
-/// let mut ws = WebSocketStream::server(stream, Config::default());
+/// let mut ws = WebSocketStream::server(stream, Config::default())
+///     .with_immediate_write_shutdown();
 ///
 /// // Use the same API as regular WebSocket
 /// while let Some(msg) = ws.next().await {
@@ -85,7 +86,12 @@ impl AsyncRead for Http2Stream {
         if !self.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.recv_buf.len());
             buf.put_slice(&self.recv_buf[..to_copy]);
-            self.recv_buf.advance(to_copy);
+            if to_copy == self.recv_buf.len() {
+                // An empty Bytes cursor can still retain its entire allocation.
+                self.recv_buf = Bytes::new();
+            } else {
+                self.recv_buf.advance(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -104,10 +110,12 @@ impl AsyncRead for Http2Stream {
                 // Copy what we can to the output buffer
                 let to_copy = std::cmp::min(buf.remaining(), data.len());
                 buf.put_slice(&data[..to_copy]);
-                data.advance(to_copy);
-
                 // Retain the owned h2 DATA remainder for the next read.
-                self.recv_buf = data;
+                // Fully consumed chunks are dropped immediately, including at EOF.
+                if to_copy < data.len() {
+                    data.advance(to_copy);
+                    self.recv_buf = data;
+                }
 
                 Poll::Ready(Ok(()))
             }
@@ -195,4 +203,19 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<super::Http2Stream>();
     }
+}
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+#[path = "../../tests/support/h2_receive_owner.rs"]
+pub(crate) mod receive_owner;
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+#[tokio::test]
+async fn consumed_h2_chunk_releases_its_owner() {
+    receive_owner::check_consumed_chunk_is_released(|send, recv, bytes| {
+        let mut stream = Http2Stream::new(send, recv);
+        stream.recv_buf = bytes;
+        stream
+    })
+    .await;
 }

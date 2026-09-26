@@ -1,33 +1,34 @@
 #![cfg(all(feature = "tokio-runtime", feature = "http2"))]
 
 use bytes::Bytes;
+use rstest::rstest;
 use sockudo_ws::http2::stream::Http2Stream;
 use tokio::io::AsyncReadExt;
 
+#[rstest]
+#[case(false, 7)]
+#[case(true, 7)]
+#[case(false, 65536)]
+#[case(true, 65536)]
 #[tokio::test]
-async fn small_reads_preserve_h2_data_and_buffered_remainder() {
-    check_buffered_remainder(false).await;
-}
-
-#[tokio::test]
-async fn generic_transport_preserves_h2_data_and_buffered_remainder() {
-    check_buffered_remainder(true).await;
-}
-
-async fn check_buffered_remainder(generic_transport: bool) {
+async fn reads_preserve_h2_data_across_flow_control_and_eof(
+    #[case] generic_transport: bool,
+    #[case] read_size: usize,
+) {
     // Exceed the initial flow-control window so progress requires returned capacity.
     let expected = (0..128 * 1024 + 1)
         .map(|i| (i % 251) as u8)
         .collect::<Vec<_>>();
     let payload = expected.clone();
+    let (ready, receiver) = tokio::sync::oneshot::channel();
     let (client_io, server_io) = tokio::io::duplex(65536);
     let server = tokio::spawn(async move {
         let mut connection = h2::server::handshake(server_io).await.unwrap();
         let (_, mut response) = connection.accept().await.unwrap().unwrap();
-        let mut send = response
+        let send = response
             .send_response(http::Response::new(()), false)
             .unwrap();
-        send.send_data(Bytes::from(payload), true).unwrap();
+        ready.send(send).unwrap();
         // Continue driving the connection until the client has consumed the DATA.
         while connection.accept().await.is_some() {}
     });
@@ -48,8 +49,14 @@ async fn check_buffered_remainder(generic_transport: bool) {
     } else {
         Box::new(Http2Stream::new(send, recv))
     };
+    let mut peer = receiver.await.unwrap();
+    let mut first = [0; 1];
+    let mut pending = Box::pin(stream.read(&mut first));
+    assert!(futures_util::poll!(&mut pending).is_pending());
+    drop(pending);
+    peer.send_data(Bytes::from(payload), true).unwrap();
     let mut actual = Vec::new();
-    let mut chunk = [0; 7];
+    let mut chunk = vec![0; read_size];
     loop {
         let n = stream.read(&mut chunk).await.unwrap();
         if n == 0 {
